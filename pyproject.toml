@@ -1,0 +1,59 @@
+[project]
+name = "diploai"
+version = "0.1.0"
+description = "LLM agents play classic Diplomacy against each other"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "diplomacy>=1.1.2",
+    "fastapi>=0.136.1",
+    "litellm>=1.85.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "uvicorn>=0.47.0",
+    "websockets>=16.0",
+]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.59.0",
+    "poethepoet>=0.46.0",
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Task runner — invoke with `uv run poe <task>` or just `poe <task>` once the
+# project's .venv is activated. See docs/glossary.md for terminology.
+# ──────────────────────────────────────────────────────────────────────────────
+[tool.poe.tasks]
+
+# ── Dev server ────────────────────────────────────────────────────────────────
+dev        = "uvicorn backend.main:app --reload --port 8000"
+dev-remote = { env = { MONGODB_URI = "${RAILWAY_MONGODB_URI}" }, cmd = "uvicorn backend.main:app --reload --port 8000" }
+
+# ── Local MongoDB via Podman ──────────────────────────────────────────────────
+# First time on a new macOS box:
+#   poe podman:init
+#   poe podman:start
+# Then:
+#   poe db:up   # starts local Mongo on :27017
+"podman:init"  = "podman machine init"
+"podman:start" = "podman machine start"
+"podman:stop"  = "podman machine stop"
+
+"db:up"      = "podman run -d --name diploai-mongo -p 27017:27017 -v diploai-mongo-data:/data/db docker.io/library/mongo:7"
+"db:down"    = { shell = "podman stop diploai-mongo && podman rm diploai-mongo" }
+"db:restart" = ["db:down", "db:up"]
+"db:wipe"    = { shell = "podman stop diploai-mongo 2>/dev/null; podman rm diploai-mongo 2>/dev/null; podman volume rm diploai-mongo-data 2>/dev/null; podman run -d --name diploai-mongo -p 27017:27017 -v diploai-mongo-data:/data/db docker.io/library/mongo:7" }
+"db:shell"   = "podman exec -it diploai-mongo mongosh diploai"
+"db:logs"    = "podman logs -f diploai-mongo"
+"db:status"  = "podman ps --filter name=diploai-mongo"
+
+# ── Quality ───────────────────────────────────────────────────────────────────
+lint   = "ruff check backend"
+format = "ruff format backend"
+test   = "pytest"
+
+# ── Bootstrap (first-time setup once Podman is initialised) ───────────────────
+setup = ["db:up"]

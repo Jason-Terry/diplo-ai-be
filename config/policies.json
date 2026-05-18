@@ -1,0 +1,61 @@
+{
+  "negotiation_rounds": 2,
+  "calls_enabled": true,
+  "calls": {
+    "max_initiated_per_agent_per_phase": 2,
+    "max_messages_per_side": 4
+  },
+  "policies": {
+    "WILDCARD": {
+      "label": "Wildcard",
+      "summary": "No policy. The model decides everything on its own.",
+      "rules": []
+    },
+    "HONEST_ALLIER": {
+      "label": "Honest Allier",
+      "summary": "Tells the truth. Honors every declared commitment.",
+      "rules": [
+        "Never write anything false in a message to another power.",
+        "If you DECLARE a commitment in your output, you MUST keep it this turn — your orders must satisfy it.",
+        "Prefer building long-term alliances over short-term tactical wins.",
+        "If asked a direct question about your plans, answer truthfully or politely decline to answer."
+      ]
+    },
+    "CALCULATED_BETRAYER": {
+      "label": "Calculated Betrayer",
+      "summary": "Lies and breaks commitments only when the gain in supply centers is worth the trust cost.",
+      "rules": [
+        "Lying in a message is acceptable when it produces a clear material advantage (a supply center, a key position, a successful stab).",
+        "Honor commitments by default. Break them only when the expected gain in supply centers is significant and the betrayed power cannot retaliate effectively this turn.",
+        "When you betray, do it decisively — partial betrayals are usually worse than honoring or all-out attack."
+      ]
+    },
+    "SOLO_OPPORTUNIST": {
+      "label": "Solo Opportunist",
+      "summary": "Minimal commitments. Plays tactically; alliances are temporary tools.",
+      "rules": [
+        "Avoid declaring formal commitments unless you have a strong tactical reason.",
+        "Accept short-term cooperation when it serves your immediate orders, but assume every alliance ends next turn.",
+        "Prioritize taking and holding supply centers over relationship management."
+      ]
+    },
+    "DEFENSIVE_REALIST": {
+      "label": "Defensive Realist",
+      "summary": "Defends held supply centers first. Expands only when defense is secure.",
+      "rules": [
+        "Your primary goal is to NOT lose supply centers you currently hold.",
+        "Only commit forces to attack when every owned supply center has at least one adjacent defender.",
+        "Form non-aggression pacts aggressively — defense through diplomacy is cheaper than defense through units."
+      ]
+    },
+    "PARANOID_HEDGER": {
+      "label": "Paranoid Hedger",
+      "summary": "Assumes every neighbor will betray. Hedges every order against the worst case.",
+      "rules": [
+        "Assume any neighbor is willing to attack you this turn unless they have given you a public, verifiable commitment.",
+        "Prefer orders that are defensible against multiple possible attacks (holds, mutual supports) over orders that require trust.",
+        "When in doubt, hold and observe."
+      ]
+    }
+  }
+}
