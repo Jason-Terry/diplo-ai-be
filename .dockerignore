@@ -1,4 +1,8 @@
-# Python
+# Git
+.git/
+.gitignore
+
+# Python build / cache
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,20 +19,24 @@ dist/
 .coverage
 htmlcov/
 
-# Env
+# Secrets & local config
 .env
 .env.local
-
-# uv
-.uv/
 
 # Game artifacts
 logs/
 artifacts/
 data/game_state.json
 
+# Tests / dev tooling we don't need in the image
+test_*.py
+scripts/
+
 # Editor / OS
 .DS_Store
 .vscode/
 .idea/
-*.swp
+
+# Docs (kept in repo, not in image)
+README.md
+docs/

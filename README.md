@@ -17,16 +17,16 @@ cp .env.example .env       # then fill in ANTHROPIC_API_KEY etc.
 ## Run
 
 ```bash
-poe dev                    # uvicorn on :8000 with reload
+poe dev                    # uvicorn on :8421 with reload
 ```
 
-Open `http://localhost:8000/api/state` to sanity-check, then point the frontend
-at `http://localhost:8000` via its `VITE_API_BASE_URL`.
+Open `http://localhost:8421/api/state` to sanity-check, then point the frontend
+at `http://localhost:8421` via its `VITE_API_BASE_URL`.
 
 ## Tasks (poethepoet)
 
 ```bash
-poe dev          # local dev server (:8000)
+poe dev          # local dev server (:8421)
 poe dev-remote   # dev server pointed at Railway-hosted Mongo
 poe db:up        # local Mongo (podman)
 poe db:down

@@ -29,8 +29,8 @@ dev = [
 [tool.poe.tasks]
 
 # ── Dev server ────────────────────────────────────────────────────────────────
-dev        = "uvicorn backend.main:app --reload --port 8000"
-dev-remote = { env = { MONGODB_URI = "${RAILWAY_MONGODB_URI}" }, cmd = "uvicorn backend.main:app --reload --port 8000" }
+dev        = "uvicorn backend.main:app --reload --port 8421"
+dev-remote = { env = { MONGODB_URI = "${RAILWAY_MONGODB_URI}" }, cmd = "uvicorn backend.main:app --reload --port 8421" }
 
 # ── Local MongoDB via Podman ──────────────────────────────────────────────────
 # First time on a new macOS box:

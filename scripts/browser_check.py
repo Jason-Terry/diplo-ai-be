@@ -4,7 +4,7 @@ Usage:
     uv run python scripts/browser_check.py            # baseline screenshots
     uv run python scripts/browser_check.py --flow     # walk through a full game flow
 
-Assumes the backend is running on http://localhost:8000.
+Assumes the backend is running on http://localhost:8421.
 """
 
 import argparse
