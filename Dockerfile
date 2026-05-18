@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Multi-stage build for diplo-ai-be.
 # Stage 1 (builder): pulls deps + project into a uv-managed .venv.
 # Stage 2 (runtime): copies only the venv + source onto a slim python image.
@@ -16,15 +14,12 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Install deps in a cached layer — only re-runs when uv.lock / pyproject.toml change.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
 
 # Now bring in the project source and finalize the venv.
 COPY . /app
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 FROM python:3.14-slim-bookworm AS runtime
