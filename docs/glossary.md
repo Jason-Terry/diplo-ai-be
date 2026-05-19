@@ -1,4 +1,4 @@
-# Diplomacy AI — Glossary
+# MetisDolos — Glossary
 
 Canonical terminology for the project. Use these terms in code, in events, in
 URLs, and in conversation. **Do not invent synonyms** — if a concept doesn't fit

@@ -53,7 +53,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-app = FastAPI(title="Diplomacy AI")
+app = FastAPI(title="MetisDolos")
 
 # CORS — used once the frontend is served from a separate origin (Vite dev or
 # Railway static deploy). In monorepo dev FE+BE share an origin, so this is a

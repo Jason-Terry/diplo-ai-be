@@ -1,7 +1,9 @@
 # diplo-ai-be
 
-Backend for **Diplomacy AI** — seven LLM agents play Diplomacy against each
-other. FastAPI + python `diplomacy` engine + LiteLLM-routed models. Deploys to
+Backend for **MetisDolos** — an AI-alignment benchmark built on the game of
+Diplomacy. Seven LLM agents drive the seven Great Powers; the engine records
+every commitment alongside the order that fulfilled or broke it. FastAPI +
+python `diplomacy` engine + LiteLLM-routed models. Deploys to
 [Railway](https://railway.app) via `Dockerfile` (see `railway.json`).
 
 Frontend lives in [`diplo-ai-fe`](https://github.com/Jason-Terry/diplo-ai-fe).
