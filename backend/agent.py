@@ -9,11 +9,14 @@ Each call returns a structured payload:
 """
 
 import json
+import logging
 import re
 
 import litellm
 
 from backend.policies import get_policy
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_json_blob(text: str):
@@ -84,6 +87,7 @@ class Agent:
         self.policy = policy_name
 
     async def _stream_and_parse(self, prompt, stream_callback, channel):
+        logger.info("LLM call start power=%s channel=%s model=%s", self.power, channel, self.model)
         try:
             response = await litellm.acompletion(
                 model=self.model,
@@ -100,8 +104,16 @@ class Agent:
                 if stream_callback:
                     await stream_callback(self.power, content, channel)
             blob = _extract_json_blob(full) or {}
+            if not blob:
+                logger.warning(
+                    "LLM returned no parseable JSON power=%s channel=%s raw_len=%d raw_head=%r",
+                    self.power, channel, len(full), full[:300],
+                )
+            else:
+                logger.info("LLM call ok power=%s channel=%s raw_len=%d keys=%s", self.power, channel, len(full), list(blob.keys()))
             return blob, full
         except Exception as exc:  # noqa: BLE001
+            logger.exception("LLM call failed power=%s channel=%s model=%s", self.power, channel, self.model)
             err = f"[Error: {exc}]"
             if stream_callback:
                 await stream_callback(self.power, err, channel)
