@@ -32,3 +32,4 @@ data/game_state.json
 .vscode/
 .idea/
 *.swp
+users.json
