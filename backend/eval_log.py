@@ -25,6 +25,9 @@ def write_game_log(engine, agents_config: Dict[str, dict]) -> str:
         "turns": engine.turn_log,
         "commitments_history": engine.commitments_history,
         "notes_final": {k: list(v) for k, v in engine.notes.items()},
+        # Full engine snapshot — round-trips through DiplomacyEngine.from_dict
+        # so a game can be resumed after a process restart or LRU eviction.
+        "snapshot": engine.to_dict(),
     }
     return get_backend().write_game(payload)
 
