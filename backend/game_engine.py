@@ -15,9 +15,9 @@ NOTE_BUFFER_CHARS = 4000
 
 
 class DiplomacyEngine:
-    def __init__(self):
+    def __init__(self, game_id: str | None = None):
         self.game = Game()
-        self.game_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        self.game_id = game_id or f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
         self.started_at = time.time()
         self.messages: List[dict] = []
         self.last_results: dict = {}
@@ -677,3 +677,52 @@ class DiplomacyEngine:
             "round_summary": round_summary,
             "last_phase_orders": self.last_phase_orders,
         }
+
+    # ---------- Snapshot / rehydrate ----------
+
+    def to_dict(self) -> dict:
+        """Full engine state for persistence. Round-trips through from_dict."""
+        from diplomacy.utils.export import to_saved_game_format
+        return {
+            "game_id": self.game_id,
+            "started_at": self.started_at,
+            "diplomacy_game": to_saved_game_format(self.game),
+            "messages": self.messages,
+            "last_results": self.last_results,
+            "notes": {k: list(v) for k, v in self.notes.items()},
+            "commitments": self.commitments,
+            "commitments_history": self.commitments_history,
+            "turn_log": self.turn_log,
+            "pending_orders": {k: list(v) for k, v in self._pending_orders.items()},
+            "last_phase_orders": self.last_phase_orders,
+            "last_phase": self.last_phase,
+            "calls": self.calls,
+            "calls_history": self.calls_history,
+            "calls_initiated_by": dict(self._calls_initiated_by),
+            "units_registry": self.units_registry,
+            "loc_to_unit": dict(self._loc_to_unit),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DiplomacyEngine":
+        """Reconstruct an engine from a previous to_dict() payload."""
+        from diplomacy.utils.export import from_saved_game_format
+        e = cls.__new__(cls)
+        e.game = from_saved_game_format(d["diplomacy_game"])
+        e.game_id = d["game_id"]
+        e.started_at = d.get("started_at", time.time())
+        e.messages = list(d.get("messages", []))
+        e.last_results = dict(d.get("last_results", {}))
+        e.notes = defaultdict(list, {k: list(v) for k, v in d.get("notes", {}).items()})
+        e.commitments = list(d.get("commitments", []))
+        e.commitments_history = list(d.get("commitments_history", []))
+        e.turn_log = list(d.get("turn_log", []))
+        e._pending_orders = defaultdict(list, {k: list(v) for k, v in d.get("pending_orders", {}).items()})
+        e.last_phase_orders = dict(d.get("last_phase_orders", {}))
+        e.last_phase = d.get("last_phase", "")
+        e.calls = list(d.get("calls", []))
+        e.calls_history = list(d.get("calls_history", []))
+        e._calls_initiated_by = defaultdict(int, d.get("calls_initiated_by", {}))
+        e.units_registry = dict(d.get("units_registry", {}))
+        e._loc_to_unit = dict(d.get("loc_to_unit", {}))
+        return e
