@@ -58,6 +58,19 @@ def _living_powers(game: Game) -> List[str]:
     return [name for name, p in game.engine.game.powers.items() if p.units or p.centers]
 
 
+def _persist(game: Game) -> str | None:
+    """Snapshot the game to the log backend. Failures are logged, not raised —
+    a persistence hiccup must never break the HTTP response. Called after every
+    state change (create + each phase action) so list_games reflects reality
+    and any in-progress game survives a process restart."""
+    try:
+        return write_game_log(game.engine, game.agent_config)
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
+        return None
+
+
 # ---------- Policies / config ----------
 
 @app.get("/api/policies")
@@ -81,6 +94,7 @@ async def list_all_games():
 @app.post("/api/games")
 async def create_game(config: GameConfig):
     game = registry.create(config.agents_config)
+    _persist(game)  # appear in /api/games immediately
     await game.manager.broadcast({"type": "game_started", "config": game.agent_config})
     return {"game_id": game.game_id, "status": "started", "config": game.agent_config}
 
@@ -303,6 +317,7 @@ async def run_negotiation(game_id: str):
             await asyncio.gather(*(_run_call(game, c, round_state) for c in batch))
 
     game.engine.phase_step = PhaseStep.ORDERS
+    _persist(game)
     await game.manager.broadcast({"type": "phase_end", "phase": "negotiate"})
     return {
         "status": "ok",
@@ -360,6 +375,7 @@ async def run_orders(game_id: str):
         await game.manager.broadcast({"type": "orders_set", "power": power, **res})
 
     game.engine.phase_step = PhaseStep.ADJUDICATE
+    _persist(game)
     await game.manager.broadcast({"type": "phase_end", "phase": "orders"})
     return {"status": "ok", "phase_step": game.engine.phase_step, "summary": summary}
 
@@ -368,10 +384,8 @@ async def run_orders(game_id: str):
 async def adjudicate_turn(game_id: str):
     game = _require_game(game_id)
     result = game.engine.process_turn()
-    try:
-        write_game_log(game.engine, game.agent_config)
-    except Exception as exc:  # noqa: BLE001
-        result["log_warning"] = str(exc)
+    if _persist(game) is None:
+        result["log_warning"] = "persist failed (see backend logs)"
     await game.manager.broadcast({"type": "adjudicated", **result})
     return {"status": "ok", **result}
 
