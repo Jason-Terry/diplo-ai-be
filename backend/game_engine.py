@@ -14,11 +14,32 @@ VICTORY_CENTERS = 18
 NOTE_BUFFER_CHARS = 4000
 
 
+# Phase-step state machine. The engine owns this so a resumed game picks up
+# exactly where it left off — the FE renders the action button purely from
+# `phase_step` rather than maintaining its own counter.
+#
+#   negotiate  → ready to call agents.negotiate()       (movement phases only)
+#   orders     → ready to collect orders from agents
+#   adjudicate → orders are in, ready to call process_turn()
+#   complete   → game is over; no more actions
+class PhaseStep:
+    NEGOTIATE = "negotiate"
+    ORDERS = "orders"
+    ADJUDICATE = "adjudicate"
+    COMPLETE = "complete"
+
+
+def _initial_step_for_phase_type(phase_type: str) -> str:
+    """Movement phases start with negotiation; retreats/adjustments skip it."""
+    return PhaseStep.NEGOTIATE if phase_type == "M" else PhaseStep.ORDERS
+
+
 class DiplomacyEngine:
     def __init__(self, game_id: str | None = None):
         self.game = Game()
         self.game_id = game_id or f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
         self.started_at = time.time()
+        self.phase_step: str = _initial_step_for_phase_type(self.game.phase_type)
         self.messages: List[dict] = []
         self.last_results: dict = {}
 
@@ -242,6 +263,7 @@ class DiplomacyEngine:
 
         return {
             "turn": turn,
+            "phase_step": self.phase_step,
             "powers": powers,
             "units": units,
             "dislodged": dislodged,
@@ -669,6 +691,15 @@ class DiplomacyEngine:
         })
 
         self.messages = []
+
+        # Advance the phase-step machine: if the game is won we're done, else
+        # the next step is determined by the new phase type (M ⇒ negotiate,
+        # R/A ⇒ go straight to orders).
+        if self._winner() is not None or self.game.is_game_done:
+            self.phase_step = PhaseStep.COMPLETE
+        else:
+            self.phase_step = _initial_step_for_phase_type(self.game.phase_type)
+
         return {
             "previous_phase": prev_phase,
             "current_phase": self.game.phase,
@@ -676,6 +707,7 @@ class DiplomacyEngine:
             "resolved_commitments": finished_commitments,
             "round_summary": round_summary,
             "last_phase_orders": self.last_phase_orders,
+            "phase_step": self.phase_step,
         }
 
     # ---------- Snapshot / rehydrate ----------
@@ -686,6 +718,7 @@ class DiplomacyEngine:
         return {
             "game_id": self.game_id,
             "started_at": self.started_at,
+            "phase_step": self.phase_step,
             "diplomacy_game": to_saved_game_format(self.game),
             "messages": self.messages,
             "last_results": self.last_results,
@@ -711,6 +744,9 @@ class DiplomacyEngine:
         e.game = from_saved_game_format(d["diplomacy_game"])
         e.game_id = d["game_id"]
         e.started_at = d.get("started_at", time.time())
+        # Default to the natural step for the current phase type when a doc
+        # predates the phase_step field (i.e. games written before this commit).
+        e.phase_step = d.get("phase_step") or _initial_step_for_phase_type(e.game.phase_type)
         e.messages = list(d.get("messages", []))
         e.last_results = dict(d.get("last_results", {}))
         e.notes = defaultdict(list, {k: list(v) for k, v in d.get("notes", {}).items()})

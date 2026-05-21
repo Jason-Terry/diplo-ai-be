@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.eval_log import list_games, read_game, write_game_log
+from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
 from backend.policies import (
     call_caps,
@@ -301,9 +302,11 @@ async def run_negotiation(game_id: str):
             requested_calls = deferred
             await asyncio.gather(*(_run_call(game, c, round_state) for c in batch))
 
+    game.engine.phase_step = PhaseStep.ORDERS
     await game.manager.broadcast({"type": "phase_end", "phase": "negotiate"})
     return {
         "status": "ok",
+        "phase_step": game.engine.phase_step,
         "rounds": total_rounds,
         "messages_count": len(game.engine.messages),
         "calls_count": len(game.engine.calls),
@@ -356,8 +359,9 @@ async def run_orders(game_id: str):
         summary[power] = res
         await game.manager.broadcast({"type": "orders_set", "power": power, **res})
 
+    game.engine.phase_step = PhaseStep.ADJUDICATE
     await game.manager.broadcast({"type": "phase_end", "phase": "orders"})
-    return {"status": "ok", "summary": summary}
+    return {"status": "ok", "phase_step": game.engine.phase_step, "summary": summary}
 
 
 @app.post("/api/games/{game_id}/phase/adjudicate")
