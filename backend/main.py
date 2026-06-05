@@ -10,7 +10,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -45,6 +45,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Belt-and-suspenders: when something raises out of a handler unexpectedly,
+# Starlette's ServerErrorMiddleware can return a 500 response without the
+# CORS headers stamped on it, which the browser then surfaces as a CORS
+# error rather than the actual 500. This handler re-emits the response with
+# the same CORS headers the middleware would have added, so the FE sees the
+# real status code and message.
+@app.exception_handler(Exception)
+async def cors_aware_500(request: Request, exc: Exception):
+    logger = logging.getLogger("backend.main")
+    logger.exception("unhandled exception on %s %s", request.method, request.url.path)
+    origin = request.headers.get("origin", "")
+    headers: Dict[str, str] = {}
+    if origin and origin in _cors_origins:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        {"detail": "internal server error"},
+        status_code=500,
+        headers=headers,
+    )
+
 
 app.include_router(auth_router)
 
