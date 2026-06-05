@@ -34,6 +34,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from backend.auth_store import get_user_backend
+from backend.email_templates import password_reset_email, verification_email
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,10 @@ VERIFICATION_TTL_SECONDS = 60 * 60 * 24 * 2  # 48h
 # the window is tighter; users still have time to click through but the
 # blast radius if the inbox is compromised is small.
 PASSWORD_RESET_TTL_SECONDS = 60 * 60  # 1h
+# GitHub OAuth state cookie — set on /github/start, read on /github/callback,
+# cleared either way. Short-lived because the round trip should take seconds.
+GITHUB_STATE_COOKIE = "metisdolos_gh_state"
+GITHUB_STATE_TTL_SECONDS = 60 * 10  # 10 min
 
 
 def _jwt_secret() -> str:
@@ -132,33 +137,13 @@ def _send_verification_email(to_email: str, token: str, first_name: str) -> None
         )
         return
 
-    from_addr = os.environ.get("EMAIL_FROM", "MetisDolos <noreply@metisdolos.com>")
-    body_html = (
-        f"<p>Hi {first_name or 'there'},</p>"
-        f"<p>Thanks for signing up for MetisDolos. Click the link below to verify "
-        f"your email so you can start running games:</p>"
-        f'<p><a href="{link}">Verify my email</a></p>'
-        f"<p>If you didn't sign up, ignore this email.</p>"
+    body_html = verification_email(first_name=first_name, link=link)
+    _resend_send(
+        api_key=api_key,
+        to_email=to_email,
+        subject="Verify your MetisDolos account",
+        html=body_html,
     )
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": from_addr,
-                    "to": [to_email],
-                    "subject": "Verify your MetisDolos account",
-                    "html": body_html,
-                },
-            )
-            if resp.status_code >= 300:
-                logger.error("resend send failed status=%s body=%s", resp.status_code, resp.text[:300])
-    except Exception:  # noqa: BLE001
-        logger.exception("resend send raised")
 
 
 def _send_password_reset_email(to_email: str, token: str, first_name: str) -> None:
@@ -176,15 +161,19 @@ def _send_password_reset_email(to_email: str, token: str, first_name: str) -> No
         )
         return
 
-    from_addr = os.environ.get("EMAIL_FROM", "MetisDolos <noreply@metisdolos.com>")
-    body_html = (
-        f"<p>Hi {first_name or 'there'},</p>"
-        f"<p>We got a request to reset the password on your MetisDolos account. "
-        f"Click the link below to choose a new one. The link expires in one hour.</p>"
-        f'<p><a href="{link}">Reset my password</a></p>'
-        f"<p>If you didn't request this, you can ignore this email — your password "
-        f"won't change.</p>"
+    body_html = password_reset_email(first_name=first_name, link=link)
+    _resend_send(
+        api_key=api_key,
+        to_email=to_email,
+        subject="Reset your MetisDolos password",
+        html=body_html,
     )
+
+
+def _resend_send(*, api_key: str, to_email: str, subject: str, html: str) -> None:
+    """Single chokepoint for Resend POST so retries / logging / errors stay
+    consistent across all transactional emails."""
+    from_addr = os.environ.get("EMAIL_FROM", "MetisDolos <noreply@metisdolos.com>")
     try:
         with httpx.Client(timeout=10) as client:
             resp = client.post(
@@ -196,8 +185,8 @@ def _send_password_reset_email(to_email: str, token: str, first_name: str) -> No
                 json={
                     "from": from_addr,
                     "to": [to_email],
-                    "subject": "Reset your MetisDolos password",
-                    "html": body_html,
+                    "subject": subject,
+                    "html": html,
                 },
             )
             if resp.status_code >= 300:
@@ -229,6 +218,19 @@ class ForgotPasswordIn(BaseModel):
 class ResetPasswordIn(BaseModel):
     token: str
     password: str = Field(min_length=8, max_length=128)
+
+
+class UpdateProfileIn(BaseModel):
+    """All fields optional — the FE sends only what changed. Email is
+    deliberately not editable here; that needs a re-verification flow."""
+    first_name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    last_name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    username: Optional[str] = Field(default=None, min_length=2, max_length=32)
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class UserOut(BaseModel):
@@ -485,5 +487,62 @@ def reset_password(body: ResetPasswordIn, response: Response) -> UserOut:
     _set_session_cookie(response, user["_id"])
     logger.info("password reset completed user_id=%s", user["_id"])
     # Refetch so the returned doc reflects the update.
+    fresh = get_user_backend().find_by_id(user["_id"]) or user
+    return _to_user_out(fresh)
+
+
+@router.put("/me", response_model=UserOut)
+def update_me(body: UpdateProfileIn, user: dict = Depends(current_user)) -> UserOut:
+    """Update editable profile fields. Sends only the fields the FE
+    actually changed; everything missing is left alone."""
+    backend = get_user_backend()
+    updates: dict = {}
+
+    if body.first_name is not None and body.first_name.strip() != user.get("first_name", ""):
+        updates["first_name"] = body.first_name.strip()
+    if body.last_name is not None and body.last_name.strip() != user.get("last_name", ""):
+        updates["last_name"] = body.last_name.strip()
+    if body.username is not None:
+        new_username = body.username.strip()
+        if new_username != user.get("username", ""):
+            if not new_username.replace("_", "").replace("-", "").isalnum():
+                raise HTTPException(
+                    status_code=400,
+                    detail="username must be alphanumeric (dashes/underscores allowed)",
+                )
+            existing = backend.find_by_username(new_username)
+            if existing and existing["_id"] != user["_id"]:
+                raise HTTPException(status_code=409, detail="username taken")
+            updates["username"] = new_username
+
+    if not updates:
+        return _to_user_out(user)
+
+    backend.update_user(user["_id"], updates)
+    fresh = backend.find_by_id(user["_id"]) or user
+    logger.info("profile updated user_id=%s fields=%s", user["_id"], list(updates.keys()))
+    return _to_user_out(fresh)
+
+
+@router.post("/change-password", response_model=UserOut)
+def change_password(
+    body: ChangePasswordIn,
+    response: Response,
+    user: dict = Depends(current_user),
+) -> UserOut:
+    """Require the current password (so a stolen cookie alone can't change
+    it). Reissues the session cookie on success; older cookies remain valid
+    until they expire because JWT is stateless, but the freshly-issued one
+    is what the FE will use going forward."""
+    if not user.get("hashed_password") or not verify_password(body.current_password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="current password is wrong")
+    if body.new_password == body.current_password:
+        raise HTTPException(status_code=400, detail="new password must differ from current")
+
+    get_user_backend().update_user(user["_id"], {
+        "hashed_password": hash_password(body.new_password),
+    })
+    _set_session_cookie(response, user["_id"])
+    logger.info("password changed user_id=%s", user["_id"])
     fresh = get_user_backend().find_by_id(user["_id"]) or user
     return _to_user_out(fresh)
