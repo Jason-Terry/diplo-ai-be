@@ -5,10 +5,14 @@ description = "LLM agents play classic Diplomacy against each other"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "bcrypt>=4.2.0",
     "diplomacy>=1.1.2",
+    "email-validator>=2.2.0",
     "fastapi>=0.136.1",
+    "httpx>=0.28.0",
     "litellm>=1.85.0",
     "pydantic>=2.13.4",
+    "pyjwt>=2.10.0",
     "pymongo>=4.10.0",
     "python-dotenv>=1.2.2",
     "uvicorn>=0.47.0",

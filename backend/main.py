@@ -10,11 +10,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from backend.auth import current_user_verified, router as auth_router
 from backend.eval_log import list_games, read_game, write_game_log
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
@@ -28,18 +29,24 @@ from backend.policies import (
 
 app = FastAPI(title="MetisDolos")
 
-# CORS — used once the frontend is served from a separate origin (Vite dev or
-# Railway static deploy). In monorepo dev FE+BE share an origin, so this is a
-# no-op. Set CORS_ALLOWED_ORIGINS to a comma-separated list in production.
-_cors_env = os.environ.get("CORS_ALLOWED_ORIGINS", "*")
-_cors_origins = ["*"] if _cors_env.strip() == "*" else [o.strip() for o in _cors_env.split(",") if o.strip()]
+# CORS — credentials (cookies) require an explicit origin list, not "*".
+# Default to localhost for dev; prod must set CORS_ALLOWED_ORIGINS to a
+# comma-separated list of FE origins. Once a session cookie is in play we
+# can never use a wildcard, so we treat "*" as invalid here.
+_cors_env = (os.environ.get("CORS_ALLOWED_ORIGINS") or "").strip()
+if _cors_env and _cors_env != "*":
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = ["http://localhost:8420", "http://127.0.0.1:8420"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 
 class GameConfig(BaseModel):
@@ -92,7 +99,7 @@ async def list_all_games():
 
 
 @app.post("/api/games")
-async def create_game(config: GameConfig):
+async def create_game(config: GameConfig, user: dict = Depends(current_user_verified)):
     game = registry.create(config.agents_config)
     _persist(game)  # appear in /api/games immediately
     await game.manager.broadcast({"type": "game_started", "config": game.agent_config})
