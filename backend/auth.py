@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 COOKIE_NAME = "metisdolos_session"
 VERIFICATION_TTL_SECONDS = 60 * 60 * 24 * 2  # 48h
+# Password reset links live for an hour. Higher-stakes than email verify, so
+# the window is tighter; users still have time to click through but the
+# blast radius if the inbox is compromised is small.
+PASSWORD_RESET_TTL_SECONDS = 60 * 60  # 1h
 
 
 def _jwt_secret() -> str:
@@ -157,6 +161,51 @@ def _send_verification_email(to_email: str, token: str, first_name: str) -> None
         logger.exception("resend send raised")
 
 
+def _send_password_reset_email(to_email: str, token: str, first_name: str) -> None:
+    """Same shape as the verify email — link points at the FE, not the BE,
+    because the reset flow is purely FE-driven (FE shows the new-password
+    form and POSTs the token to /api/auth/reset-password)."""
+    fe_url = os.environ.get("PUBLIC_FE_URL", "http://localhost:8420").rstrip("/")
+    link = f"{fe_url}/?reset={token}"
+
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        logger.warning(
+            "RESEND_API_KEY unset — would have emailed %s with reset link %s",
+            to_email, link,
+        )
+        return
+
+    from_addr = os.environ.get("EMAIL_FROM", "MetisDolos <noreply@metisdolos.com>")
+    body_html = (
+        f"<p>Hi {first_name or 'there'},</p>"
+        f"<p>We got a request to reset the password on your MetisDolos account. "
+        f"Click the link below to choose a new one. The link expires in one hour.</p>"
+        f'<p><a href="{link}">Reset my password</a></p>'
+        f"<p>If you didn't request this, you can ignore this email — your password "
+        f"won't change.</p>"
+    )
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": from_addr,
+                    "to": [to_email],
+                    "subject": "Reset your MetisDolos password",
+                    "html": body_html,
+                },
+            )
+            if resp.status_code >= 300:
+                logger.error("resend send failed status=%s body=%s", resp.status_code, resp.text[:300])
+    except Exception:  # noqa: BLE001
+        logger.exception("resend send raised")
+
+
 # ─── Pydantic models ─────────────────────────────────────────────────────────
 
 
@@ -171,6 +220,15 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: str
     password: str
+
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    password: str = Field(min_length=8, max_length=128)
 
 
 class UserOut(BaseModel):
@@ -356,3 +414,76 @@ def resend_verification(user: dict = Depends(current_user)) -> dict:
     })
     _send_verification_email(user["email"], token, user.get("first_name", ""))
     return {"status": "sent"}
+
+
+def _find_user_by_reset_token(token: str) -> Optional[dict]:
+    """Backend-agnostic lookup. Mirrors the scan path used by /verify."""
+    backend = get_user_backend()
+    from backend.auth_store import FileUserBackend, MongoUserBackend
+    if isinstance(backend, MongoUserBackend):
+        return backend.users.find_one({"reset_token": token})
+    if isinstance(backend, FileUserBackend):
+        for u in backend._load().values():
+            if u.get("reset_token") == token:
+                return u
+    return None
+
+
+@router.post("/forgot-password")
+def forgot_password(body: ForgotPasswordIn) -> dict:
+    """Issue a password-reset token + email it. Always returns the same shape
+    so that callers can't probe which emails are registered."""
+    try:
+        email = validate_email(body.email, check_deliverability=False).normalized.lower()
+    except EmailNotValidError:
+        # Don't even hint that the email was malformed — same response.
+        return {"status": "sent"}
+
+    backend = get_user_backend()
+    user = backend.find_by_email(email)
+    if user:
+        token = secrets.token_urlsafe(32)
+        backend.update_user(user["_id"], {
+            "reset_token": token,
+            "reset_token_expires_at": time.time() + PASSWORD_RESET_TTL_SECONDS,
+        })
+        _send_password_reset_email(email, token, user.get("first_name", ""))
+        logger.info("password reset issued user_id=%s", user["_id"])
+    else:
+        # Sleep a beat to match the timing of the happy path so existence
+        # can't be inferred from response latency either.
+        time.sleep(0.05)
+        logger.info("password reset requested for unknown email")
+
+    return {"status": "sent"}
+
+
+@router.post("/reset-password", response_model=UserOut)
+def reset_password(body: ResetPasswordIn, response: Response) -> UserOut:
+    """Consume a reset token and set a new password. On success the user is
+    signed in immediately so the FE can land them straight into the app."""
+    if not body.token:
+        raise HTTPException(status_code=400, detail="missing token")
+
+    user = _find_user_by_reset_token(body.token)
+    if not user:
+        raise HTTPException(status_code=400, detail="invalid or expired reset link")
+    if (user.get("reset_token_expires_at") or 0) < time.time():
+        # Clear the dead token so it can't be reused.
+        get_user_backend().update_user(user["_id"], {
+            "reset_token": None,
+            "reset_token_expires_at": None,
+        })
+        raise HTTPException(status_code=400, detail="invalid or expired reset link")
+
+    get_user_backend().update_user(user["_id"], {
+        "hashed_password": hash_password(body.password),
+        "reset_token": None,
+        "reset_token_expires_at": None,
+        "last_login_at": time.time(),
+    })
+    _set_session_cookie(response, user["_id"])
+    logger.info("password reset completed user_id=%s", user["_id"])
+    # Refetch so the returned doc reflects the update.
+    fresh = get_user_backend().find_by_id(user["_id"]) or user
+    return _to_user_out(fresh)

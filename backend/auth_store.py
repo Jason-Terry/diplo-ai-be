@@ -14,6 +14,8 @@ The user document shape:
         "email_verified": false,
         "verification_token": "<hex>" | null,
         "verification_token_expires_at": 1234567890.0 | null,
+        "reset_token": "<hex>" | null,
+        "reset_token_expires_at": 1234567890.0 | null,
         "github_id": "<str>" | null,
         "github_login": "<str>" | null,
         "created_at": 1234567890.0,
