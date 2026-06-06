@@ -69,10 +69,9 @@ def render_card_email(
     preheader_safe = escape(preheader)
     heading_safe = escape(heading)
     footer = footer_html if footer_html is not None else (
-        '<p style="margin: 0;">You\'re receiving this because someone '
-        "(hopefully you) used your email on "
+        '<p style="margin: 0;">Someone used your email on '
         f'<a href="https://www.metisdolos.com" style="color:{_FG_MUTED};">'
-        "MetisDolos</a>. If that wasn't you, you can safely ignore this email.</p>"
+        "MetisDolos</a>. If it wasn't you, ignore this email.</p>"
     )
 
     cta_block = ""
@@ -186,10 +185,10 @@ def verification_email(*, first_name: str, link: str) -> str:
     name = escape(first_name) if first_name else "there"
     intro = (
         f"<p style='margin: 0 0 12px;'>Hi {name},</p>"
-        "<p style='margin: 0 0 12px;'>Welcome to <strong>MetisDolos</strong> — a research "
-        "sandbox where seven LLM agents negotiate, betray, and ally their way through a "
-        "game of classic Diplomacy.</p>"
-        "<p style='margin: 0;'>Click below to verify your email so you can start running games.</p>"
+        "<p style='margin: 0 0 12px;'>Welcome to <strong>MetisDolos</strong>. Seven LLMs "
+        "play classic Diplomacy. They negotiate, betray, and ally on the way to eighteen "
+        "supply centers. You watch.</p>"
+        "<p style='margin: 0;'>Verify your email and you can start running games.</p>"
     )
     after = (
         f"<p style='margin: 0 0 8px;'>If the button doesn't work, paste this link into your browser:</p>"
@@ -212,11 +211,11 @@ def password_reset_email(*, first_name: str, link: str) -> str:
     name = escape(first_name) if first_name else "there"
     intro = (
         f"<p style='margin: 0 0 12px;'>Hi {name},</p>"
-        "<p style='margin: 0 0 12px;'>We got a request to reset the password on your "
-        "MetisDolos account. Click below to choose a new one — the link works once "
-        "and expires in <strong>one hour</strong>.</p>"
-        "<p style='margin: 0;'>If you didn't request this, you can ignore this email "
-        "— your password won't change.</p>"
+        "<p style='margin: 0 0 12px;'>Someone asked to reset the password on your "
+        "MetisDolos account. The link below works once and expires in "
+        "<strong>one hour</strong>.</p>"
+        "<p style='margin: 0;'>If you didn't ask for this, ignore this email. Your "
+        "password won't change.</p>"
     )
     after = (
         f"<p style='margin: 0 0 8px;'>If the button doesn't work, paste this link into your browser:</p>"
@@ -224,7 +223,7 @@ def password_reset_email(*, first_name: str, link: str) -> str:
         f"<a href='{safe_link}' style='color: {_ACCENT};'>{safe_link}</a></p>"
     )
     return render_card_email(
-        preheader="Reset your MetisDolos password — link expires in 1 hour.",
+        preheader="Reset your MetisDolos password. Link expires in 1 hour.",
         heading="Reset your password",
         intro_html=intro,
         cta_label="Reset my password",
