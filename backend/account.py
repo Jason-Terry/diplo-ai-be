@@ -26,6 +26,7 @@ from backend.byok import (
     models_for_providers,
     validate_api_key,
 )
+from backend.policies import get_policies
 
 logger = logging.getLogger(__name__)
 
@@ -161,3 +162,112 @@ def delete_api_key(key_id: str, user: dict = Depends(current_user)) -> None:
         raise HTTPException(status_code=404, detail="api key not found")
     get_user_backend().update_user(user["_id"], {"api_keys": new_keys})
     logger.info("api key deleted user_id=%s key_id=%s", user["_id"], key_id)
+
+
+# ─── Personas ────────────────────────────────────────────────────────────────
+#
+# A persona is the user-editable side of what used to be a policy archetype:
+# a label, a one-line summary, and a list of explicit rules that get injected
+# into the agent's system prompt at game-run time. Personas live on the user
+# doc — same reasoning as api-keys.
+
+
+class PersonaOut(BaseModel):
+    id: str
+    label: str
+    summary: str
+    rules: List[str]
+    created_at: float
+    updated_at: float
+
+
+class PersonaIn(BaseModel):
+    label: str = Field(min_length=1, max_length=64)
+    summary: str = Field(default="", max_length=240)
+    rules: List[str] = Field(default_factory=list, max_length=24)
+
+
+def _persona_out(rec: dict) -> PersonaOut:
+    return PersonaOut(
+        id=rec["id"],
+        label=rec.get("label", ""),
+        summary=rec.get("summary", ""),
+        rules=[str(r) for r in (rec.get("rules") or [])],
+        created_at=rec.get("created_at", 0),
+        updated_at=rec.get("updated_at", 0),
+    )
+
+
+@router.get("/persona-templates")
+def list_persona_templates() -> dict:
+    """Read-only catalogue of the built-in policies. The FE surfaces these
+    as "Clone from template" so users have a quick starting point rather
+    than facing a blank rules box."""
+    out = []
+    for key, p in (get_policies() or {}).items():
+        out.append({
+            "id": key,
+            "label": p.get("label") or key,
+            "summary": p.get("summary") or "",
+            "rules": list(p.get("rules") or []),
+        })
+    return {"templates": out}
+
+
+@router.get("/personas", response_model=List[PersonaOut])
+def list_personas(user: dict = Depends(current_user)) -> List[PersonaOut]:
+    return [_persona_out(p) for p in (user.get("personas") or [])]
+
+
+@router.post("/personas", response_model=PersonaOut, status_code=201)
+def add_persona(body: PersonaIn, user: dict = Depends(current_user)) -> PersonaOut:
+    personas = list(user.get("personas") or [])
+    # Per-line cleanup + dedupe consecutive blanks; keep order otherwise.
+    rules = [r.strip() for r in body.rules if r and r.strip()]
+    now = time.time()
+    rec = {
+        "id": uuid.uuid4().hex,
+        "label": body.label.strip()[:64],
+        "summary": body.summary.strip()[:240],
+        "rules": rules,
+        "created_at": now,
+        "updated_at": now,
+    }
+    personas.append(rec)
+    get_user_backend().update_user(user["_id"], {"personas": personas})
+    logger.info("persona added user_id=%s label=%s", user["_id"], rec["label"])
+    return _persona_out(rec)
+
+
+@router.put("/personas/{persona_id}", response_model=PersonaOut)
+def update_persona(
+    persona_id: str,
+    body: PersonaIn,
+    user: dict = Depends(current_user),
+) -> PersonaOut:
+    personas = list(user.get("personas") or [])
+    idx = next((i for i, p in enumerate(personas) if p.get("id") == persona_id), -1)
+    if idx == -1:
+        raise HTTPException(status_code=404, detail="persona not found")
+    rules = [r.strip() for r in body.rules if r and r.strip()]
+    rec = {
+        **personas[idx],
+        "label": body.label.strip()[:64],
+        "summary": body.summary.strip()[:240],
+        "rules": rules,
+        "updated_at": time.time(),
+    }
+    personas[idx] = rec
+    get_user_backend().update_user(user["_id"], {"personas": personas})
+    logger.info("persona updated user_id=%s id=%s", user["_id"], persona_id)
+    return _persona_out(rec)
+
+
+@router.delete("/personas/{persona_id}", status_code=204)
+def delete_persona(persona_id: str, user: dict = Depends(current_user)) -> None:
+    personas = user.get("personas") or []
+    new_personas = [p for p in personas if p.get("id") != persona_id]
+    if len(new_personas) == len(personas):
+        raise HTTPException(status_code=404, detail="persona not found")
+    get_user_backend().update_user(user["_id"], {"personas": new_personas})
+    logger.info("persona deleted user_id=%s id=%s", user["_id"], persona_id)
