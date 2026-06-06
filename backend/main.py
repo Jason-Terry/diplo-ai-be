@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from backend.account import router as account_router
 from backend.auth import current_user_verified, router as auth_router
 from backend.eval_log import list_games, read_game, write_game_log
 from backend.game_engine import PhaseStep
@@ -71,6 +72,7 @@ async def cors_aware_500(request: Request, exc: Exception):
 
 
 app.include_router(auth_router)
+app.include_router(account_router)
 
 
 class GameConfig(BaseModel):
