@@ -24,6 +24,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlencode
 
 import bcrypt
 import httpx
@@ -240,6 +241,12 @@ class UserOut(BaseModel):
     first_name: str
     last_name: str
     email_verified: bool
+    # Identity-provider links. Present if the user has linked GitHub at any
+    # point (FE shows "Connected as @login" vs "Connect GitHub").
+    github_login: Optional[str] = None
+    # True iff the user has a local bcrypt password — relevant for the
+    # account page (e.g. "Change password" only makes sense for these).
+    has_password: bool = False
 
 
 def _to_user_out(doc: dict) -> UserOut:
@@ -250,6 +257,8 @@ def _to_user_out(doc: dict) -> UserOut:
         first_name=doc.get("first_name", ""),
         last_name=doc.get("last_name", ""),
         email_verified=bool(doc.get("email_verified")),
+        github_login=doc.get("github_login") or None,
+        has_password=bool(doc.get("hashed_password")),
     )
 
 
@@ -546,3 +555,254 @@ def change_password(
     logger.info("password changed user_id=%s", user["_id"])
     fresh = get_user_backend().find_by_id(user["_id"]) or user
     return _to_user_out(fresh)
+
+
+# ─── GitHub OAuth ────────────────────────────────────────────────────────────
+#
+# Flow:
+#   FE button → GET /api/auth/github/start
+#       → set state cookie, 302 to github.com/login/oauth/authorize
+#   GitHub → user authorizes → 302 back to GET /api/auth/github/callback?code&state
+#       → validate state, exchange code for token, fetch user + emails,
+#         look up by github_id then email, upsert, set session cookie,
+#         302 to FE.
+#
+# Required env vars (prod): GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET.
+# Optional: PUBLIC_BE_URL (defaults http://localhost:8421), PUBLIC_FE_URL
+# (defaults http://localhost:8420).
+
+_GH_AUTHORIZE = "https://github.com/login/oauth/authorize"
+_GH_TOKEN = "https://github.com/login/oauth/access_token"
+_GH_API_USER = "https://api.github.com/user"
+_GH_API_EMAILS = "https://api.github.com/user/emails"
+
+
+def _gh_state_cookie_kwargs() -> dict:
+    """State cookie: short-lived, SameSite=Lax so it travels on the
+    top-level redirect back from GitHub. (Session cookies use SameSite=None
+    in prod because they're sent via cross-origin XHR; this one isn't.)"""
+    secure = os.environ.get("COOKIE_INSECURE", "").strip() != "1"
+    return {
+        "httponly": True,
+        "secure": secure,
+        "samesite": "lax",
+        "path": "/",
+    }
+
+
+def _gh_callback_url() -> str:
+    be_url = os.environ.get("PUBLIC_BE_URL", "http://localhost:8421").rstrip("/")
+    return f"{be_url}/api/auth/github/callback"
+
+
+def _fe_url() -> str:
+    return os.environ.get("PUBLIC_FE_URL", "http://localhost:8420").rstrip("/")
+
+
+@router.get("/github/start")
+def github_start(next: Optional[str] = None) -> RedirectResponse:
+    """Kick off the GitHub OAuth dance. `next` is an optional FE-relative
+    path to return the user to after sign-in (e.g. /account)."""
+    client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
+    if not client_id:
+        # Treat as misconfig rather than not-found so the FE can surface a
+        # useful message instead of a generic 404.
+        raise HTTPException(status_code=503, detail="GitHub sign-in is not configured on this server")
+
+    # State doubles as CSRF defence + a tiny payload carrier — encode the
+    # `next` path into the cookie alongside the random nonce, so we don't
+    # need a server-side session table.
+    state_nonce = secrets.token_urlsafe(24)
+    state_payload = f"{state_nonce}|{(next or '/').strip()[:200]}"
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": _gh_callback_url(),
+        "scope": "read:user user:email",
+        "state": state_nonce,
+        "allow_signup": "true",
+    }
+    redir = RedirectResponse(url=f"{_GH_AUTHORIZE}?{urlencode(params)}", status_code=302)
+    redir.set_cookie(
+        key=GITHUB_STATE_COOKIE,
+        value=state_payload,
+        max_age=GITHUB_STATE_TTL_SECONDS,
+        **_gh_state_cookie_kwargs(),
+    )
+    return redir
+
+
+def _gh_fetch_user(access_token: str) -> tuple[dict, list]:
+    """Fetch the GitHub user record + their email list. Raises on any
+    non-2xx response so the caller can surface a clean error."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    with httpx.Client(timeout=10) as client:
+        u = client.get(_GH_API_USER, headers=headers)
+        u.raise_for_status()
+        e = client.get(_GH_API_EMAILS, headers=headers)
+        e.raise_for_status()
+    return u.json(), e.json()
+
+
+def _gh_primary_verified_email(emails: list) -> Optional[str]:
+    """GitHub returns the user's emails ordered; we prefer the one marked
+    primary AND verified, then fall back to the first verified one."""
+    for e in emails or []:
+        if e.get("primary") and e.get("verified"):
+            addr = (e.get("email") or "").lower()
+            if addr:
+                return addr
+    for e in emails or []:
+        if e.get("verified"):
+            addr = (e.get("email") or "").lower()
+            if addr:
+                return addr
+    return None
+
+
+def _gh_lookup_by_id(github_id: str) -> Optional[dict]:
+    backend = get_user_backend()
+    from backend.auth_store import FileUserBackend, MongoUserBackend
+    if isinstance(backend, MongoUserBackend):
+        return backend.users.find_one({"github_id": github_id})
+    if isinstance(backend, FileUserBackend):
+        for u in backend._load().values():
+            if u.get("github_id") == github_id:
+                return u
+    return None
+
+
+def _gh_pick_username(suggested: str) -> str:
+    """GitHub login is the natural username, but it might clash with an
+    existing local account. Append -2, -3, … until we find one that's free."""
+    backend = get_user_backend()
+    base = (suggested or "user").lower()
+    # Strip anything that won't pass register()'s isalnum-with-dash-underscore check.
+    base = "".join(c if (c.isalnum() or c in "-_") else "-" for c in base) or "user"
+    candidate = base
+    n = 1
+    while backend.find_by_username(candidate):
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
+@router.get("/github/callback")
+def github_callback(
+    response: Response,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    gh_state: Optional[str] = Cookie(default=None, alias=GITHUB_STATE_COOKIE),
+) -> RedirectResponse:
+    fe = _fe_url()
+
+    # Validate state cookie first so a bad-actor-crafted URL never gets us
+    # past the CSRF guard.
+    if not code or not state or not gh_state or "|" not in gh_state:
+        return RedirectResponse(url=f"{fe}/?sso=invalid_state", status_code=302)
+    nonce, _, next_path = gh_state.partition("|")
+    if not secrets.compare_digest(state, nonce):
+        return RedirectResponse(url=f"{fe}/?sso=invalid_state", status_code=302)
+
+    client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return RedirectResponse(url=f"{fe}/?sso=not_configured", status_code=302)
+
+    # Exchange code for access token.
+    try:
+        with httpx.Client(timeout=10) as client:
+            tok = client.post(
+                _GH_TOKEN,
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": _gh_callback_url(),
+                },
+            )
+            tok.raise_for_status()
+            token_data = tok.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise ValueError(f"no access_token; got keys={list(token_data.keys())}")
+        gh_user, gh_emails = _gh_fetch_user(access_token)
+    except Exception:  # noqa: BLE001
+        logger.exception("github oauth exchange failed")
+        return RedirectResponse(url=f"{fe}/?sso=exchange_failed", status_code=302)
+
+    github_id = str(gh_user.get("id") or "")
+    github_login = gh_user.get("login") or ""
+    primary_email = _gh_primary_verified_email(gh_emails)
+    if not github_id or not primary_email:
+        return RedirectResponse(url=f"{fe}/?sso=missing_email", status_code=302)
+
+    backend = get_user_backend()
+
+    # 1. github_id already linked → log them in.
+    user = _gh_lookup_by_id(github_id)
+
+    # 2. Same email already in our DB → link the GitHub identity onto it.
+    if not user:
+        existing = backend.find_by_email(primary_email)
+        if existing:
+            backend.update_user(existing["_id"], {
+                "github_id": github_id,
+                "github_login": github_login,
+                "last_login_at": time.time(),
+            })
+            user = backend.find_by_id(existing["_id"]) or existing
+            logger.info("github linked to existing user_id=%s", existing["_id"])
+
+    # 3. Brand new account.
+    if not user:
+        full_name = (gh_user.get("name") or "").strip()
+        first, _, last = full_name.partition(" ")
+        user_id = uuid.uuid4().hex
+        now = time.time()
+        doc = {
+            "_id": user_id,
+            "username": _gh_pick_username(github_login or "user"),
+            "email": primary_email,
+            "first_name": first or github_login or "",
+            "last_name": last or "",
+            "hashed_password": None,           # they have no local password
+            "email_verified": True,            # GitHub already verified it
+            "verification_token": None,
+            "verification_token_expires_at": None,
+            "reset_token": None,
+            "reset_token_expires_at": None,
+            "github_id": github_id,
+            "github_login": github_login,
+            "created_at": now,
+            "last_login_at": now,
+        }
+        backend.create_user(doc)
+        user = doc
+        logger.info("github registered new user_id=%s github_login=%s", user_id, github_login)
+    else:
+        backend.update_user(user["_id"], {"last_login_at": time.time()})
+
+    # Issue session cookie + clear the state cookie + redirect to FE.
+    redir = RedirectResponse(
+        url=f"{fe}{next_path if next_path.startswith('/') else '/'}",
+        status_code=302,
+    )
+    token = make_jwt(user["_id"])
+    redir.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=_jwt_ttl_seconds(),
+        **_cookie_kwargs(),
+    )
+    redir.delete_cookie(
+        key=GITHUB_STATE_COOKIE,
+        path="/",
+        domain=os.environ.get("COOKIE_DOMAIN") or None,
+    )
+    return redir
