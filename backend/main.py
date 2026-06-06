@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
