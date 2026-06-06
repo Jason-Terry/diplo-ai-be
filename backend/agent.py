@@ -14,8 +14,6 @@ import re
 
 import litellm
 
-from backend.policies import get_policy
-
 logger = logging.getLogger(__name__)
 
 
@@ -68,33 +66,58 @@ def _slim_state(game_state):
     }
 
 
-def _policy_block(policy_name: str) -> str:
-    p = get_policy(policy_name)
-    if not p.get("rules"):
-        return f"Policy: {p.get('label', policy_name)} — {p.get('summary', '')}\n(No additional rules; play as you see fit.)"
-    rules = "\n".join(f"  - {r}" for r in p["rules"])
+def _persona_block(persona: dict) -> str:
+    """Persona snapshot baked into the agents_config at game-create time
+    (rather than re-fetched per call) so editing/deleting the persona
+    later doesn't perturb an in-flight game."""
+    label = (persona or {}).get("label") or "Default"
+    summary = (persona or {}).get("summary") or ""
+    rules = list((persona or {}).get("rules") or [])
+    if not rules:
+        return (
+            f"Persona: {label} — {summary}\n"
+            "(No additional rules; play as you see fit.)"
+        )
+    rules_text = "\n".join(f"  - {r}" for r in rules)
     return (
-        f"Policy: {p.get('label', policy_name)}\n"
-        f"Summary: {p.get('summary', '')}\n"
-        f"Rules you MUST follow:\n{rules}"
+        f"Persona: {label}\n"
+        f"Summary: {summary}\n"
+        f"Rules you MUST follow:\n{rules_text}"
     )
 
 
 class Agent:
-    def __init__(self, power, provider_config, policy_name):
+    def __init__(self, power, model, persona, api_key=None):
+        """Per-power agent.
+
+        Args:
+            power: e.g. "ENGLAND". Stable for the life of the game.
+            model: LiteLLM model string, e.g. "anthropic/claude-haiku-4-5-...".
+            persona: snapshot dict { label, summary, rules: [str] } — already
+                resolved from the user's persona collection at game-create.
+            api_key: the user's plaintext provider key (decrypted on the
+                server-side per call). None falls back to env-var auth so
+                local dev still works without BYOK.
+        """
         self.power = power
-        self.model = provider_config.get("model", "anthropic/claude-haiku-4-5-20251001")
-        self.policy = policy_name
+        self.model = model or "anthropic/claude-haiku-4-5-20251001"
+        self.persona = persona or {}
+        self.api_key = api_key
 
     async def _stream_and_parse(self, prompt, stream_callback, channel):
         logger.info("LLM call start power=%s channel=%s model=%s", self.power, channel, self.model)
         try:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=True,
-                max_tokens=2500,
-            )
+            kwargs = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+                "max_tokens": 2500,
+            }
+            if self.api_key:
+                # LiteLLM honours per-call api_key for all the providers we
+                # care about (Anthropic, OpenAI, Gemini).
+                kwargs["api_key"] = self.api_key
+            response = await litellm.acompletion(**kwargs)
             full = ""
             async for chunk in response:
                 content = chunk.choices[0].delta.content
@@ -147,7 +170,7 @@ Add calls to the response under "calls": [{{"to": "FRANCE", "topic": "Burgundy s
 
         prompt = f"""You are playing classic Diplomacy as {self.power}.
 
-{_policy_block(self.policy)}
+{_persona_block(self.persona)}
 
 Negotiation round {round_index + 1} of {total_rounds}.
 
@@ -220,7 +243,7 @@ Examples of good notes:
 
         prompt = f"""You are playing classic Diplomacy as {self.power}.
 
-{_policy_block(self.policy)}
+{_persona_block(self.persona)}
 
 You are in a PRIVATE CALL with {other_party}.
 Topic: "{topic}"
@@ -311,7 +334,7 @@ Set `end_call: true` when you want to close the call (and explain in `end_reason
 
         prompt = f"""You are playing classic Diplomacy as {self.power}.
 
-{_policy_block(self.policy)}
+{_persona_block(self.persona)}
 
 Your private notebook:
 \"\"\"

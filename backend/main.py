@@ -15,8 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from backend.account import router as account_router
+from backend.account import (
+    FREE_TRIAL_PRESET_ID,
+    POWERS_ORDER,
+    find_user_key,
+    free_trial_preset,
+    increment_free_trial,
+    resolve_persona,
+    router as account_router,
+)
 from backend.auth import current_user_verified, router as auth_router
+from backend.byok import encrypt_key, decrypt_key, PROVIDERS
 from backend.eval_log import list_games, read_game, write_game_log
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
@@ -75,8 +84,96 @@ app.include_router(auth_router)
 app.include_router(account_router)
 
 
-class GameConfig(BaseModel):
-    agents_config: Dict[str, Dict[str, str]]
+class GameSlot(BaseModel):
+    """One row of the Setup modal — which (model, persona) to run for a power."""
+    model_id: str
+    persona_id: str
+
+
+class CreateGameIn(BaseModel):
+    """New game creation contract (BYOK).
+
+    Two ways to fire a game:
+      1. preset_id: "__free_trial__"           — uses the platform-bundled
+         Haiku + Wildcard slots, decrements the user's free-trial counter.
+         Any `slots` are ignored.
+      2. slots: { POWER: {model_id, persona_id} } — user-defined config; each
+         model_id must be unlocked by one of the user's stored API keys, and
+         each persona_id must be one the user owns.
+    """
+    preset_id: Optional[str] = None
+    slots: Optional[Dict[str, GameSlot]] = None
+
+
+def _provider_of_model(model_id: str) -> Optional[str]:
+    """Reverse-lookup the catalog to find which provider a model belongs
+    to (so we know which key to use)."""
+    for provider_id, spec in PROVIDERS.items():
+        for m in spec.get("models") or []:
+            if m["id"] == model_id:
+                return provider_id
+    return None
+
+
+def _build_agents_config(user: dict, body: CreateGameIn) -> Dict[str, dict]:
+    """Resolve the request body into the persisted agents_config shape the
+    game store + agent runner expect:
+        { POWER: { model, persona: {label,summary,rules}, api_key_cipher } }
+
+    Raises HTTPException with a useful detail when anything's missing.
+    The free-trial path uses platform-side keys (env-var auth via litellm)
+    so api_key_cipher is omitted for those slots."""
+    # 1) Pick the slot map — either the free-trial bundle or the user's input.
+    is_free_trial = body.preset_id == FREE_TRIAL_PRESET_ID
+    if is_free_trial:
+        ft = free_trial_preset(user)
+        if ft["free_trial_used"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Free trial already used on this account. Add an API key in /account/models to start more games.",
+            )
+        raw_slots = ft["slots"]  # all 7 powers, fixed model + WILDCARD persona
+    elif body.slots:
+        raw_slots = {k: v.model_dump() for k, v in body.slots.items()}
+    else:
+        raise HTTPException(status_code=400, detail="either preset_id or slots is required")
+
+    missing = [p for p in POWERS_ORDER if p not in raw_slots]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"missing slot(s): {', '.join(missing)}")
+
+    # 2) Per-slot resolution.
+    config: Dict[str, dict] = {}
+    for power in POWERS_ORDER:
+        slot = raw_slots[power]
+        model_id = slot["model_id"]
+        persona_id = slot["persona_id"]
+
+        provider_id = _provider_of_model(model_id)
+        if not provider_id:
+            raise HTTPException(status_code=400, detail=f"{power}: unknown model {model_id}")
+
+        persona = resolve_persona(user, persona_id)
+
+        entry: dict = {"model": model_id, "persona": persona}
+
+        if is_free_trial:
+            # Platform-paid — litellm reads from env-var auth.
+            pass
+        else:
+            key_rec = find_user_key(user, provider_id)
+            if not key_rec:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{power}: you don't have an API key for {provider_id} (model {model_id})",
+                )
+            # The persisted key is already encrypted; re-encrypting would
+            # uselessly burn a Fernet round-trip. Pass the ciphertext through.
+            entry["api_key_cipher"] = key_rec["ciphertext"]
+
+        config[power] = entry
+
+    return config
 
 
 def _require_game(game_id: str) -> Game:
@@ -125,11 +222,20 @@ async def list_all_games():
 
 
 @app.post("/api/games")
-async def create_game(config: GameConfig, user: dict = Depends(current_user_verified)):
-    game = registry.create(config.agents_config)
+async def create_game(body: CreateGameIn, user: dict = Depends(current_user_verified)):
+    agents_config = _build_agents_config(user, body)
+    game = registry.create(agents_config)
+    # Free-trial bookkeeping AFTER the game registers — if registry.create
+    # blew up we shouldn't burn the user's one trial.
+    if body.preset_id == FREE_TRIAL_PRESET_ID:
+        increment_free_trial(user)
     _persist(game)  # appear in /api/games immediately
-    await game.manager.broadcast({"type": "game_started", "config": game.agent_config})
-    return {"game_id": game.game_id, "status": "started", "config": game.agent_config}
+    # Strip the encrypted key when broadcasting / returning so it never
+    # reaches the FE or the WS feed by accident.
+    safe_config = {p: {k: v for k, v in c.items() if k != "api_key_cipher"}
+                   for p, c in agents_config.items()}
+    await game.manager.broadcast({"type": "game_started", "config": safe_config})
+    return {"game_id": game.game_id, "status": "started", "config": safe_config}
 
 
 @app.get("/api/games/{game_id}")
@@ -146,7 +252,12 @@ async def get_state(game_id: str):
     game = _require_game(game_id)
     state = game.engine.get_state()
     state["game_id"] = game_id
-    state["agents_config"] = game.agent_config
+    # Never expose the encrypted key over the API — even ciphertext leaks
+    # narrow attacker time budget for offline brute-forcing.
+    state["agents_config"] = {
+        p: {k: v for k, v in c.items() if k != "api_key_cipher"}
+        for p, c in (game.agent_config or {}).items()
+    }
     state["initialized"] = bool(game.agents)
     state["negotiation_rounds"] = negotiation_rounds()
     return state

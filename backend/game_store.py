@@ -74,13 +74,33 @@ class Game:
         self.last_used = time.time()
 
 
-def _build_agents(agent_config: Dict[str, Dict[str, str]]) -> Dict[str, Agent]:
-    """Construct fresh Agent wrappers from a persisted agents_config blob."""
+def _build_agents(agent_config: Dict[str, dict]) -> Dict[str, Agent]:
+    """Construct fresh Agent wrappers from a persisted agents_config blob.
+
+    Persisted shape (new — BYOK):
+        { POWER: {
+            "model":          "anthropic/claude-haiku-4-5-...",
+            "persona":        { "label": ..., "summary": ..., "rules": [...] },
+            "api_key_cipher": "<fernet-encrypted user key>"  # optional
+        } }
+
+    api_key_cipher is decrypted lazily (decrypt failures fall back to env-var
+    auth so a rotated BYOK_SECRET breaks gracefully instead of bombing the
+    runner)."""
+    from backend.byok import decrypt_key  # local import: keeps cold-start lean
+
     agents: Dict[str, Agent] = {}
     for power, conf in agent_config.items():
-        model = conf.get("provider", "anthropic/claude-haiku-4-5-20251001")
-        policy = conf.get("policy") or conf.get("personality", "WILDCARD")
-        agents[power] = Agent(power, {"model": model}, policy)
+        model = conf.get("model") or "anthropic/claude-haiku-4-5-20251001"
+        persona = conf.get("persona") or {}
+        api_key: Optional[str] = None
+        ct = conf.get("api_key_cipher")
+        if ct:
+            try:
+                api_key = decrypt_key(ct)
+            except Exception:  # noqa: BLE001
+                logger.exception("api_key_cipher decrypt failed power=%s", power)
+        agents[power] = Agent(power, model, persona, api_key=api_key)
     return agents
 
 
@@ -91,16 +111,14 @@ class GameRegistry:
         self._games: "OrderedDict[str, Game]" = OrderedDict()
         self._max = max_in_memory
 
-    def create(self, agents_config: Dict[str, Dict[str, str]]) -> Game:
+    def create(self, agents_config: Dict[str, dict]) -> Game:
+        """Caller (the /api/games endpoint) is responsible for resolving each
+        slot to its persisted shape (model + persona snapshot + encrypted
+        key). We don't transform here so the caller is the single source of
+        truth for the new BYOK contract."""
         engine = DiplomacyEngine()
-        # Normalize agents_config to the persisted shape (provider + policy).
-        normalized: Dict[str, Dict[str, str]] = {}
-        for power, conf in agents_config.items():
-            model = conf.get("provider", "anthropic/claude-haiku-4-5-20251001")
-            policy = conf.get("policy") or conf.get("personality", "WILDCARD")
-            normalized[power] = {"provider": model, "policy": policy}
-        agents = _build_agents(normalized)
-        game = Game(engine, agents, normalized)
+        agents = _build_agents(agents_config)
+        game = Game(engine, agents, agents_config)
         self._games[game.game_id] = game
         self._games.move_to_end(game.game_id)
         self._evict_if_needed()

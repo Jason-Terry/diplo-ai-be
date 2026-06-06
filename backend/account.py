@@ -271,3 +271,185 @@ def delete_persona(persona_id: str, user: dict = Depends(current_user)) -> None:
         raise HTTPException(status_code=404, detail="persona not found")
     get_user_backend().update_user(user["_id"], {"personas": new_personas})
     logger.info("persona deleted user_id=%s id=%s", user["_id"], persona_id)
+
+
+# ─── Presets ─────────────────────────────────────────────────────────────────
+#
+# A preset is a saved 7-power roster: per-power (model_id, persona_id) pairs.
+# Picking a preset in the Setup modal fills every dropdown at once. The
+# special id "__free_trial__" is the platform-provided Haiku + Wildcard
+# bundle each verified user can use exactly once on us.
+
+FREE_TRIAL_PRESET_ID = "__free_trial__"
+FREE_TRIAL_MODEL = "anthropic/claude-haiku-4-5-20251001"
+FREE_TRIAL_POLICY_KEY = "WILDCARD"  # taken from config/policies.json
+
+POWERS_ORDER: List[str] = [
+    "ENGLAND", "FRANCE", "GERMANY", "ITALY", "AUSTRIA", "RUSSIA", "TURKEY"
+]
+
+
+class PresetSlot(BaseModel):
+    """One row of a preset — which model + which of the user's personas to
+    use for that power. persona_id MUST be one the user owns; model_id MUST
+    be one their keys unlock. Validation happens at /api/games create time
+    so saved presets remain valid as the user's keys/personas churn."""
+    model_id: str
+    persona_id: str
+
+
+class PresetIn(BaseModel):
+    label: str = Field(min_length=1, max_length=64)
+    summary: str = Field(default="", max_length=240)
+    slots: dict[str, PresetSlot]  # keyed by power name (ENGLAND, FRANCE, …)
+
+
+class PresetOut(BaseModel):
+    id: str
+    label: str
+    summary: str
+    slots: dict[str, PresetSlot]
+    created_at: float
+    is_free_trial: bool = False
+    free_trial_used: bool = False  # only meaningful when is_free_trial=True
+
+
+def _preset_out(rec: dict) -> PresetOut:
+    return PresetOut(
+        id=rec["id"],
+        label=rec.get("label", ""),
+        summary=rec.get("summary", ""),
+        slots={
+            k: PresetSlot(**v) for k, v in (rec.get("slots") or {}).items()
+        },
+        created_at=rec.get("created_at", 0),
+        is_free_trial=bool(rec.get("is_free_trial")),
+        free_trial_used=bool(rec.get("free_trial_used")),
+    )
+
+
+def free_trial_preset(user: dict) -> dict:
+    """Build the synthetic free-trial preset for this user. Same fixed
+    bundle for everyone — Haiku + WILDCARD — but the `free_trial_used`
+    flag is per-user so the FE can disable it once it's been spent."""
+    slots = {p: {"model_id": FREE_TRIAL_MODEL, "persona_id": FREE_TRIAL_POLICY_KEY}
+             for p in POWERS_ORDER}
+    used = (user.get("free_trial_games_used") or 0) >= 1
+    return {
+        "id": FREE_TRIAL_PRESET_ID,
+        "label": "Free trial — Haiku + Wildcard",
+        "summary": "On us, once per account. All seven powers run Claude Haiku 4.5 with the Wildcard persona.",
+        "slots": slots,
+        "created_at": 0,
+        "is_free_trial": True,
+        "free_trial_used": used,
+    }
+
+
+@router.get("/presets", response_model=List[PresetOut])
+def list_presets(user: dict = Depends(current_user)) -> List[PresetOut]:
+    """Free trial first, then the user's saved presets newest-first."""
+    out = [_preset_out(free_trial_preset(user))]
+    for rec in reversed(user.get("presets") or []):
+        out.append(_preset_out(rec))
+    return out
+
+
+@router.post("/presets", response_model=PresetOut, status_code=201)
+def add_preset(body: PresetIn, user: dict = Depends(current_user)) -> PresetOut:
+    """Saved presets are user-owned. We don't validate that the referenced
+    model_ids + persona_ids still exist here — the user might delete a key
+    and then re-add it. Validation happens at game-create time."""
+    presets = list(user.get("presets") or [])
+    if len(presets) >= 30:
+        raise HTTPException(status_code=400, detail="preset limit reached (30); delete one first")
+    rec = {
+        "id": uuid.uuid4().hex,
+        "label": body.label.strip()[:64],
+        "summary": body.summary.strip()[:240],
+        "slots": {k: v.model_dump() for k, v in body.slots.items()},
+        "created_at": time.time(),
+    }
+    presets.append(rec)
+    get_user_backend().update_user(user["_id"], {"presets": presets})
+    logger.info("preset added user_id=%s label=%s", user["_id"], rec["label"])
+    return _preset_out(rec)
+
+
+@router.put("/presets/{preset_id}", response_model=PresetOut)
+def update_preset(
+    preset_id: str,
+    body: PresetIn,
+    user: dict = Depends(current_user),
+) -> PresetOut:
+    if preset_id == FREE_TRIAL_PRESET_ID:
+        raise HTTPException(status_code=400, detail="the free-trial preset is built in and not editable")
+    presets = list(user.get("presets") or [])
+    idx = next((i for i, p in enumerate(presets) if p.get("id") == preset_id), -1)
+    if idx == -1:
+        raise HTTPException(status_code=404, detail="preset not found")
+    presets[idx] = {
+        **presets[idx],
+        "label": body.label.strip()[:64],
+        "summary": body.summary.strip()[:240],
+        "slots": {k: v.model_dump() for k, v in body.slots.items()},
+    }
+    get_user_backend().update_user(user["_id"], {"presets": presets})
+    return _preset_out(presets[idx])
+
+
+@router.delete("/presets/{preset_id}", status_code=204)
+def delete_preset(preset_id: str, user: dict = Depends(current_user)) -> None:
+    if preset_id == FREE_TRIAL_PRESET_ID:
+        raise HTTPException(status_code=400, detail="the free-trial preset is built in and not deletable")
+    presets = user.get("presets") or []
+    new_presets = [p for p in presets if p.get("id") != preset_id]
+    if len(new_presets) == len(presets):
+        raise HTTPException(status_code=404, detail="preset not found")
+    get_user_backend().update_user(user["_id"], {"presets": new_presets})
+
+
+# ─── Game-config helpers (consumed by /api/games) ────────────────────────────
+
+
+def resolve_persona(user: dict, persona_id: str) -> dict:
+    """Snapshot a persona's content from the user's collection. For the
+    free-trial preset we resolve against the BE-bundled policy archetypes
+    instead; that way users who haven't created any personas can still run
+    the free trial."""
+    # Free trial: WILDCARD lives in the built-in policy catalog.
+    if persona_id == FREE_TRIAL_POLICY_KEY:
+        p = (get_policies() or {}).get(persona_id) or {}
+        return {
+            "id": persona_id,
+            "label": p.get("label") or persona_id,
+            "summary": p.get("summary") or "",
+            "rules": list(p.get("rules") or []),
+        }
+    # User personas.
+    for p in (user.get("personas") or []):
+        if p.get("id") == persona_id:
+            return {
+                "id": p["id"],
+                "label": p.get("label", ""),
+                "summary": p.get("summary", ""),
+                "rules": list(p.get("rules") or []),
+            }
+    raise HTTPException(status_code=400, detail=f"persona not found: {persona_id}")
+
+
+def find_user_key(user: dict, provider_id: str) -> Optional[dict]:
+    """Return the stored ApiKey record for a provider, or None."""
+    for k in (user.get("api_keys") or []):
+        if k.get("provider") == provider_id:
+            return k
+    return None
+
+
+def increment_free_trial(user: dict) -> None:
+    """Bump the per-user free-trial counter. Caller must have already
+    decided this game uses the free-trial preset and that it's still
+    available."""
+    used = int(user.get("free_trial_games_used") or 0) + 1
+    get_user_backend().update_user(user["_id"], {"free_trial_games_used": used})
+    logger.info("free trial consumed user_id=%s total=%d", user["_id"], used)
