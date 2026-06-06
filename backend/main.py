@@ -21,6 +21,7 @@ from backend.account import (
     find_user_key,
     free_trial_preset,
     increment_free_trial,
+    is_admin,
     resolve_persona,
     router as account_router,
 )
@@ -127,6 +128,10 @@ def _build_agents_config(user: dict, body: CreateGameIn) -> Dict[str, dict]:
     is_free_trial = body.preset_id == FREE_TRIAL_PRESET_ID
     if is_free_trial:
         ft = free_trial_preset(user)
+        # free_trial_used already accounts for admin status (always False
+        # for admins). This check is the BE's only line of defence — the
+        # FE only disables the option, so a determined caller can still
+        # try to POST past that.
         if ft["free_trial_used"]:
             raise HTTPException(
                 status_code=403,
@@ -226,8 +231,9 @@ async def create_game(body: CreateGameIn, user: dict = Depends(current_user_veri
     agents_config = _build_agents_config(user, body)
     game = registry.create(agents_config)
     # Free-trial bookkeeping AFTER the game registers — if registry.create
-    # blew up we shouldn't burn the user's one trial.
-    if body.preset_id == FREE_TRIAL_PRESET_ID:
+    # blew up we shouldn't burn the user's one trial. Admins never consume
+    # the counter (they have unlimited Haiku + Wildcard).
+    if body.preset_id == FREE_TRIAL_PRESET_ID and not is_admin(user):
         increment_free_trial(user)
     _persist(game)  # appear in /api/games immediately
     # Strip the encrypted key when broadcasting / returning so it never

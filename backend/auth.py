@@ -247,6 +247,10 @@ class UserOut(BaseModel):
     # True iff the user has a local bcrypt password — relevant for the
     # account page (e.g. "Change password" only makes sense for these).
     has_password: bool = False
+    # Platform-level admin (project owner). Bypasses the BYOK free-trial
+    # gate so we can demo/dogfood the free-trial bundle without burning the
+    # one allotment per pass.
+    is_admin: bool = False
 
 
 def _to_user_out(doc: dict) -> UserOut:
@@ -259,6 +263,7 @@ def _to_user_out(doc: dict) -> UserOut:
         email_verified=bool(doc.get("email_verified")),
         github_login=doc.get("github_login") or None,
         has_password=bool(doc.get("hashed_password")),
+        is_admin=bool(doc.get("is_admin")),
     )
 
 

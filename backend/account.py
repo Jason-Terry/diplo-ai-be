@@ -331,10 +331,16 @@ def _preset_out(rec: dict) -> PresetOut:
 def free_trial_preset(user: dict) -> dict:
     """Build the synthetic free-trial preset for this user. Same fixed
     bundle for everyone — Haiku + WILDCARD — but the `free_trial_used`
-    flag is per-user so the FE can disable it once it's been spent."""
+    flag is per-user so the FE can disable it once it's been spent.
+
+    Admins (is_admin=True) never appear to have used the trial — they get
+    unlimited Haiku + Wildcard for demos/dogfooding."""
     slots = {p: {"model_id": FREE_TRIAL_MODEL, "persona_id": FREE_TRIAL_POLICY_KEY}
              for p in POWERS_ORDER}
-    used = (user.get("free_trial_games_used") or 0) >= 1
+    used = (
+        not bool(user.get("is_admin"))
+        and (user.get("free_trial_games_used") or 0) >= 1
+    )
     return {
         "id": FREE_TRIAL_PRESET_ID,
         "label": "Free trial — Haiku + Wildcard",
@@ -344,6 +350,10 @@ def free_trial_preset(user: dict) -> dict:
         "is_free_trial": True,
         "free_trial_used": used,
     }
+
+
+def is_admin(user: dict) -> bool:
+    return bool(user.get("is_admin"))
 
 
 @router.get("/presets", response_model=List[PresetOut])
