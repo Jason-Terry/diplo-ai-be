@@ -30,12 +30,13 @@ import bcrypt
 import httpx
 import jwt
 from email_validator import EmailNotValidError, validate_email
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from backend.auth_store import get_user_backend
 from backend.email_templates import password_reset_email, verification_email
+from backend.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +322,8 @@ def _set_session_cookie(response: Response, user_id: str) -> None:
 
 
 @router.post("/register", response_model=UserOut)
-def register(body: RegisterIn, response: Response) -> UserOut:
+@limiter.limit("3/minute")
+def register(request: Request, body: RegisterIn, response: Response) -> UserOut:
     # Normalize + validate
     username = body.username.strip()
     if not username.replace("_", "").replace("-", "").isalnum():
@@ -364,7 +366,8 @@ def register(body: RegisterIn, response: Response) -> UserOut:
 
 
 @router.post("/login", response_model=UserOut)
-def login(body: LoginIn, response: Response) -> UserOut:
+@limiter.limit("10/minute")
+def login(request: Request, body: LoginIn, response: Response) -> UserOut:
     backend = get_user_backend()
     user = backend.find_by_email(body.email.strip().lower())
     if not user or not user.get("hashed_password") or not verify_password(body.password, user["hashed_password"]):
@@ -413,7 +416,8 @@ def verify(token: str) -> RedirectResponse:
 
 
 @router.post("/resend-verification")
-def resend_verification(user: dict = Depends(current_user)) -> dict:
+@limiter.limit("3/minute")
+def resend_verification(request: Request, user: dict = Depends(current_user)) -> dict:
     if user.get("email_verified"):
         return {"status": "already_verified"}
     token = secrets.token_urlsafe(32)
@@ -431,7 +435,8 @@ def _find_user_by_reset_token(token: str) -> Optional[dict]:
 
 
 @router.post("/forgot-password")
-def forgot_password(body: ForgotPasswordIn) -> dict:
+@limiter.limit("3/minute")
+def forgot_password(request: Request, body: ForgotPasswordIn) -> dict:
     """Issue a password-reset token + email it. Always returns the same shape
     so that callers can't probe which emails are registered."""
     try:
@@ -460,7 +465,8 @@ def forgot_password(body: ForgotPasswordIn) -> dict:
 
 
 @router.post("/reset-password", response_model=UserOut)
-def reset_password(body: ResetPasswordIn, response: Response) -> UserOut:
+@limiter.limit("5/minute")
+def reset_password(request: Request, body: ResetPasswordIn, response: Response) -> UserOut:
     """Consume a reset token and set a new password. On success the user is
     signed in immediately so the FE can land them straight into the app."""
     if not body.token:
@@ -524,7 +530,9 @@ def update_me(body: UpdateProfileIn, user: dict = Depends(current_user)) -> User
 
 
 @router.post("/change-password", response_model=UserOut)
+@limiter.limit("5/minute")
 def change_password(
+    request: Request,
     body: ChangePasswordIn,
     response: Response,
     user: dict = Depends(current_user),

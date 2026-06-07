@@ -5,15 +5,20 @@ LogBackend (file or Mongo — see log_backend.py).
 """
 
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 from backend.log_backend import get_backend
 
 
-def write_game_log(engine, agents_config: Dict[str, dict]) -> str:
+def write_game_log(
+    engine,
+    agents_config: Dict[str, dict],
+    owner_id: Optional[str] = None,
+) -> str:
     state = engine.get_state()
     payload = {
         "game_id": engine.game_id,
+        "owner_id": owner_id,
         "started_at": engine.started_at,
         "updated_at": time.time(),
         "agents_config": agents_config,
@@ -32,9 +37,17 @@ def write_game_log(engine, agents_config: Dict[str, dict]) -> str:
     return get_backend().write_game(payload)
 
 
-def list_games() -> list:
-    return get_backend().list_games()
+def list_games(owner_id: Optional[str] = None) -> list:
+    """Filter to a single owner's games when owner_id is supplied; otherwise
+    everything (admin / migration / dev use)."""
+    return get_backend().list_games(owner_id=owner_id)
 
 
 def read_game(game_id: str) -> dict:
     return get_backend().read_game(game_id)
+
+
+def backfill_owner_id(owner_id: str) -> int:
+    """Stamp owner_id onto every persisted game that doesn't have one yet.
+    Returns the number of records updated. Idempotent."""
+    return get_backend().backfill_owner_id(owner_id)

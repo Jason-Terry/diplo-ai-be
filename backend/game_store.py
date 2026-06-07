@@ -52,17 +52,23 @@ class ConnectionManager:
 
 
 class Game:
-    """One live Diplomacy game. Owns engine + agents + WS connections."""
+    """One live Diplomacy game. Owns engine + agents + WS connections.
+
+    `owner_id` is the user-id of the account that created the game. Used by
+    main.py to gate every read/write path so users can't read each other's
+    matches over the API or the WS feed."""
 
     def __init__(
         self,
         engine: DiplomacyEngine,
         agents: Dict[str, Agent],
         agent_config: Dict[str, Dict[str, str]],
+        owner_id: Optional[str] = None,
     ) -> None:
         self.engine = engine
         self.agents = agents
         self.agent_config = agent_config
+        self.owner_id = owner_id
         self.manager = ConnectionManager()
         self.last_used = time.time()
 
@@ -111,18 +117,18 @@ class GameRegistry:
         self._games: "OrderedDict[str, Game]" = OrderedDict()
         self._max = max_in_memory
 
-    def create(self, agents_config: Dict[str, dict]) -> Game:
+    def create(self, agents_config: Dict[str, dict], owner_id: str) -> Game:
         """Caller (the /api/games endpoint) is responsible for resolving each
         slot to its persisted shape (model + persona snapshot + encrypted
         key). We don't transform here so the caller is the single source of
         truth for the new BYOK contract."""
         engine = DiplomacyEngine()
         agents = _build_agents(agents_config)
-        game = Game(engine, agents, agents_config)
+        game = Game(engine, agents, agents_config, owner_id=owner_id)
         self._games[game.game_id] = game
         self._games.move_to_end(game.game_id)
         self._evict_if_needed()
-        logger.info("game created id=%s powers=%s", game.game_id, list(agents.keys()))
+        logger.info("game created id=%s owner=%s powers=%s", game.game_id, owner_id, list(agents.keys()))
         return game
 
     def get(self, game_id: str) -> Optional[Game]:
@@ -149,11 +155,11 @@ class GameRegistry:
             return None
         agents_config = doc.get("agents_config") or {}
         agents = _build_agents(agents_config)
-        game = Game(engine, agents, agents_config)
+        game = Game(engine, agents, agents_config, owner_id=doc.get("owner_id"))
         self._games[game_id] = game
         self._games.move_to_end(game_id)
         self._evict_if_needed()
-        logger.info("game rehydrated id=%s phase=%s", game_id, engine.game.phase)
+        logger.info("game rehydrated id=%s owner=%s phase=%s", game_id, game.owner_id, engine.game.phase)
         return game
 
     def drop(self, game_id: str) -> None:

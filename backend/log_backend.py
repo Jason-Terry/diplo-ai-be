@@ -29,16 +29,24 @@ class LogBackend(ABC):
     def write_game(self, payload: dict) -> str: ...
 
     @abstractmethod
-    def list_games(self) -> list[dict]: ...
+    def list_games(self, owner_id: str | None = None) -> list[dict]: ...
 
     @abstractmethod
     def read_game(self, game_id: str) -> dict: ...
+
+    @abstractmethod
+    def backfill_owner_id(self, owner_id: str) -> int:
+        """Stamp owner_id onto every record missing one. Idempotent.
+        Returns the count of records updated. Existed-with-different-owner
+        records are NOT touched."""
+        ...
 
 
 def _summarize(doc: dict) -> dict:
     """Project a full game document to the index-row fields."""
     return {
         "game_id": doc.get("game_id"),
+        "owner_id": doc.get("owner_id"),
         "winner": doc.get("winner"),
         "is_complete": doc.get("is_complete"),
         "turns": len(doc.get("turns", [])),
@@ -69,7 +77,7 @@ class FileBackend(LogBackend):
             json.dump(payload, f, indent=2, default=str)
         return path
 
-    def list_games(self) -> list[dict]:
+    def list_games(self, owner_id: str | None = None) -> list[dict]:
         if not os.path.isdir(self.logs_dir):
             return []
         out: list[dict] = []
@@ -78,9 +86,12 @@ class FileBackend(LogBackend):
                 continue
             try:
                 with open(os.path.join(self.logs_dir, fname), encoding="utf-8") as f:
-                    out.append(_summarize(json.load(f)))
+                    doc = json.load(f)
             except Exception:
                 continue
+            if owner_id is not None and doc.get("owner_id") != owner_id:
+                continue
+            out.append(_summarize(doc))
         return out
 
     def read_game(self, game_id: str) -> dict:
@@ -89,6 +100,29 @@ class FileBackend(LogBackend):
             return {}
         with open(path, encoding="utf-8") as f:
             return json.load(f)
+
+    def backfill_owner_id(self, owner_id: str) -> int:
+        if not os.path.isdir(self.logs_dir):
+            return 0
+        n = 0
+        for fname in os.listdir(self.logs_dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(self.logs_dir, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            if doc.get("owner_id"):
+                continue
+            doc["owner_id"] = owner_id
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, default=str)
+            os.replace(tmp, path)
+            n += 1
+        return n
 
 
 # ─── Mongo backend ───────────────────────────────────────────────────────────
@@ -114,11 +148,13 @@ class MongoBackend(LogBackend):
         self.games.replace_one({"_id": doc["_id"]}, doc, upsert=True)
         return doc["_id"]
 
-    def list_games(self) -> list[dict]:
+    def list_games(self, owner_id: str | None = None) -> list[dict]:
+        query: dict = {} if owner_id is None else {"owner_id": owner_id}
         cursor = self.games.find(
-            {},
+            query,
             projection={
                 "game_id": 1,
+                "owner_id": 1,
                 "winner": 1,
                 "is_complete": 1,
                 "turns": 1,
@@ -134,6 +170,13 @@ class MongoBackend(LogBackend):
             return {}
         doc.pop("_id", None)
         return doc
+
+    def backfill_owner_id(self, owner_id: str) -> int:
+        result = self.games.update_many(
+            {"$or": [{"owner_id": {"$exists": False}}, {"owner_id": None}]},
+            {"$set": {"owner_id": owner_id}},
+        )
+        return int(result.modified_count)
 
 
 # ─── Factory ────────────────────────────────────────────────────────────────

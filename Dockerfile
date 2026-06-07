@@ -41,4 +41,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 EXPOSE 8421
 
 # `sh -c` so $PORT expands from Railway's env at runtime, not at build time.
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}"]
+# --proxy-headers + --forwarded-allow-ips=* so the app trusts Railway's edge
+# proxy and slowapi sees the real client IP via X-Forwarded-For (without
+# this every request looks like Railway's edge and rate limiting collapses).
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips=*"]

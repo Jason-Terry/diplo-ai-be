@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from backend.auth import current_user
@@ -27,6 +27,7 @@ from backend.byok import (
     validate_api_key,
 )
 from backend.policies import get_policies
+from backend.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,12 @@ def list_api_keys(user: dict = Depends(current_user)) -> List[ApiKeyOut]:
 
 
 @router.post("/api-keys", response_model=ApiKeyOut, status_code=201)
-def add_api_key(body: ApiKeyIn, user: dict = Depends(current_user)) -> ApiKeyOut:
+@limiter.limit("5/minute")
+def add_api_key(
+    request: Request,
+    body: ApiKeyIn,
+    user: dict = Depends(current_user),
+) -> ApiKeyOut:
     if not known_provider(body.provider):
         raise HTTPException(status_code=400, detail=f"unknown provider: {body.provider}")
 
@@ -132,7 +138,12 @@ def add_api_key(body: ApiKeyIn, user: dict = Depends(current_user)) -> ApiKeyOut
 
 
 @router.post("/api-keys/{key_id}/validate", response_model=ApiKeyOut)
-def revalidate_api_key(key_id: str, user: dict = Depends(current_user)) -> ApiKeyOut:
+@limiter.limit("5/minute")
+def revalidate_api_key(
+    request: Request,
+    key_id: str,
+    user: dict = Depends(current_user),
+) -> ApiKeyOut:
     keys = list(user.get("api_keys") or [])
     rec = next((k for k in keys if k["id"] == key_id), None)
     if not rec:

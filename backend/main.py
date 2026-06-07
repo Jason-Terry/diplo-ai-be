@@ -14,6 +14,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from backend.account import (
     FREE_TRIAL_PRESET_ID,
@@ -25,9 +27,15 @@ from backend.account import (
     resolve_persona,
     router as account_router,
 )
-from backend.auth import current_user_verified, router as auth_router
+from backend.auth import (
+    COOKIE_NAME,
+    current_user_verified,
+    decode_jwt,
+    router as auth_router,
+)
+from backend.auth_store import get_user_backend
 from backend.byok import PROVIDERS
-from backend.eval_log import list_games, read_game, write_game_log
+from backend.eval_log import backfill_owner_id, list_games, read_game, write_game_log
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
 from backend.policies import (
@@ -37,8 +45,14 @@ from backend.policies import (
     negotiation_rounds,
     reload_config,
 )
+from backend.rate_limit import limiter
 
 app = FastAPI(title="MetisDolos")
+
+# Rate-limit middleware. slowapi expects `app.state.limiter` and a handler
+# for RateLimitExceeded so 429s come back as clean JSON (not HTML).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS — credentials (cookies) require an explicit origin list, not "*".
 # Default to localhost for dev; prod must set CORS_ALLOWED_ORIGINS to a
@@ -83,6 +97,31 @@ async def cors_aware_500(request: Request, exc: Exception):
 
 app.include_router(auth_router)
 app.include_router(account_router)
+
+
+@app.on_event("startup")
+def _backfill_legacy_owner_ids() -> None:
+    """One-time migration: stamp any persisted game without an owner_id with
+    the first admin user we find. Pre-ownership games would otherwise be
+    inaccessible after the ownership gate goes live (every read path 404s
+    on owner mismatch). Safe to re-run — backfill_owner_id only touches
+    records that have no owner."""
+    log = logging.getLogger("backend.main.migration")
+    try:
+        admin = get_user_backend().find_one_by_field("is_admin", True)
+    except Exception:  # noqa: BLE001
+        log.exception("backfill: failed to look up admin user; skipping")
+        return
+    if not admin:
+        log.info("backfill: no admin user — leaving legacy games owner-less")
+        return
+    try:
+        n = backfill_owner_id(admin["_id"])
+    except Exception:  # noqa: BLE001
+        log.exception("backfill: write failed; skipping")
+        return
+    if n:
+        log.info("backfill: stamped %d legacy game(s) with owner=%s", n, admin["_id"])
 
 
 class GameSlot(BaseModel):
@@ -189,6 +228,18 @@ def _require_game(game_id: str) -> Game:
     return game
 
 
+def _require_owned_game(game_id: str, user: dict) -> Game:
+    """Fetch a game the caller is allowed to see. Returns 404 (not 403) on
+    ownership mismatch so we don't leak whether a given game_id exists."""
+    game = _require_game(game_id)
+    # owner_id is None on legacy records the startup migration hasn't reached
+    # yet; treat them as inaccessible to everyone except their (eventual)
+    # owner. Once the migration runs, every doc has an owner_id.
+    if game.owner_id != user["_id"]:
+        raise HTTPException(status_code=404, detail=f"game {game_id} not found")
+    return game
+
+
 def _living_powers(game: Game) -> List[str]:
     return [name for name, p in game.engine.game.powers.items() if p.units or p.centers]
 
@@ -199,9 +250,8 @@ def _persist(game: Game) -> str | None:
     state change (create + each phase action) so list_games reflects reality
     and any in-progress game survives a process restart."""
     try:
-        return write_game_log(game.engine, game.agent_config)
+        return write_game_log(game.engine, game.agent_config, owner_id=game.owner_id)
     except Exception:  # noqa: BLE001
-        import logging
         logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
         return None
 
@@ -222,14 +272,14 @@ async def list_policies():
 # ---------- Game lifecycle ----------
 
 @app.get("/api/games")
-async def list_all_games():
-    return {"games": list_games()}
+async def list_all_games(user: dict = Depends(current_user_verified)):
+    return {"games": list_games(owner_id=user["_id"])}
 
 
 @app.post("/api/games")
 async def create_game(body: CreateGameIn, user: dict = Depends(current_user_verified)):
     agents_config = _build_agents_config(user, body)
-    game = registry.create(agents_config)
+    game = registry.create(agents_config, owner_id=user["_id"])
     # Free-trial bookkeeping AFTER the game registers — if registry.create
     # blew up we shouldn't burn the user's one trial. Admins never consume
     # the counter (they have unlimited Haiku + Wildcard).
@@ -245,17 +295,19 @@ async def create_game(body: CreateGameIn, user: dict = Depends(current_user_veri
 
 
 @app.get("/api/games/{game_id}")
-async def get_game(game_id: str):
+async def get_game(game_id: str, user: dict = Depends(current_user_verified)):
     """Full persisted document — for the games browser / history view."""
     data = read_game(game_id)
-    if not data:
+    if not data or data.get("owner_id") != user["_id"]:
+        # 404 on owner mismatch matches _require_owned_game — same shape
+        # whether the game doesn't exist or just isn't yours.
         raise HTTPException(status_code=404, detail=f"game {game_id} not found")
     return data
 
 
 @app.get("/api/games/{game_id}/state")
-async def get_state(game_id: str):
-    game = _require_game(game_id)
+async def get_state(game_id: str, user: dict = Depends(current_user_verified)):
+    game = _require_owned_game(game_id, user)
     state = game.engine.get_state()
     state["game_id"] = game_id
     # Never expose the encrypted key over the API — even ciphertext leaks
@@ -271,9 +323,23 @@ async def get_state(game_id: str):
 
 @app.websocket("/ws/games/{game_id}")
 async def websocket_endpoint(websocket: WebSocket, game_id: str):
+    """WS upgrade auth: read the session cookie that the browser attaches
+    on the upgrade request, decode the JWT, and require the caller to be
+    the game's owner. Reject with a code that's distinguishable in the FE
+    (4401 not authed, 4403 not owner, 4404 game gone)."""
+    session = websocket.cookies.get(COOKIE_NAME)
+    user_id = decode_jwt(session) if session else None
+    if not user_id:
+        await websocket.close(code=4401, reason="not authenticated")
+        return
     game = registry.get(game_id)
     if game is None:
         await websocket.close(code=4404, reason=f"game {game_id} not found")
+        return
+    if game.owner_id != user_id:
+        # 4403 (not the standard close code range — we use 4xxx for
+        # application-level reasons FastAPI rejects on accept).
+        await websocket.close(code=4403, reason="not your game")
         return
     await game.manager.connect(websocket)
     try:
@@ -356,8 +422,8 @@ async def _run_call(game: Game, call: dict, board_state: dict):
 
 
 @app.post("/api/games/{game_id}/phase/negotiate")
-async def run_negotiation(game_id: str):
-    game = _require_game(game_id)
+async def run_negotiation(game_id: str, user: dict = Depends(current_user_verified)):
+    game = _require_owned_game(game_id, user)
     if not game.agents:
         return {"status": "error", "error": "Game not initialized"}
     state = game.engine.get_state()
@@ -479,8 +545,8 @@ async def run_negotiation(game_id: str):
 
 
 @app.post("/api/games/{game_id}/phase/orders")
-async def run_orders(game_id: str):
-    game = _require_game(game_id)
+async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
+    game = _require_owned_game(game_id, user)
     if not game.agents:
         return {"status": "error", "error": "Game not initialized"}
     state = game.engine.get_state()
@@ -531,8 +597,8 @@ async def run_orders(game_id: str):
 
 
 @app.post("/api/games/{game_id}/phase/adjudicate")
-async def adjudicate_turn(game_id: str):
-    game = _require_game(game_id)
+async def adjudicate_turn(game_id: str, user: dict = Depends(current_user_verified)):
+    game = _require_owned_game(game_id, user)
     result = game.engine.process_turn()
     if _persist(game) is None:
         result["log_warning"] = "persist failed (see backend logs)"
