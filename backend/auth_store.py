@@ -147,9 +147,14 @@ class MongoUserBackend(UserBackend):
         self.db_name = db_name or path or "diploai"
         self.db = self.client[self.db_name]
         self.users = self.db["users"]
-        # Idempotent index creation; safe on repeat boots.
+        # Idempotent index creation; safe on repeat boots. Sparse on the
+        # token / github_id fields so only the small set of users actually
+        # mid-flow occupies index space (most users have these as null).
         self.users.create_index([("email", ASCENDING)], unique=True)
         self.users.create_index([("username", ASCENDING)], unique=True)
+        self.users.create_index([("verification_token", ASCENDING)], sparse=True)
+        self.users.create_index([("reset_token", ASCENDING)], sparse=True)
+        self.users.create_index([("github_id", ASCENDING)], sparse=True)
 
     def create_user(self, doc: dict) -> dict:
         self.users.insert_one(dict(doc))

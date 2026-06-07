@@ -29,8 +29,16 @@ dev = [
     "playwright>=1.59.0",
     "poethepoet>=0.46.0",
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
     "ruff>=0.6.0",
 ]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# asyncio_mode=auto lets us write `async def test_foo()` without decorating
+# each test — pytest-asyncio picks them up automatically.
+asyncio_mode = "auto"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Task runner — invoke with `uv run poe <task>` or just `poe <task>` once the
@@ -61,8 +69,8 @@ dev-remote = { env = { MONGODB_URI = "${RAILWAY_MONGODB_URI}" }, cmd = "uvicorn 
 "db:status"  = "podman ps --filter name=diploai-mongo"
 
 # ── Quality ───────────────────────────────────────────────────────────────────
-lint   = "ruff check backend"
-format = "ruff format backend"
+lint   = "ruff check backend tests"
+format = "ruff format backend tests"
 test   = "pytest"
 
 # ── Bootstrap (first-time setup once Podman is initialised) ───────────────────

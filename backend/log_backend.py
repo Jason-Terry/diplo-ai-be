@@ -133,7 +133,7 @@ class MongoBackend(LogBackend):
 
     def __init__(self, uri: str, db_name: str | None = None) -> None:
         # Local import so the file backend works in environments without pymongo.
-        from pymongo import MongoClient
+        from pymongo import ASCENDING, MongoClient
 
         self.client = MongoClient(uri)
         # Use db from URI path if present (mongodb://.../diploai), else default.
@@ -141,6 +141,9 @@ class MongoBackend(LogBackend):
         self.db_name = db_name or path or "diploai"
         self.db = self.client[self.db_name]
         self.games = self.db["games"]
+        # owner_id powers the /api/games-per-user filter; without an index
+        # every list page does a full collection scan.
+        self.games.create_index([("owner_id", ASCENDING)])
 
     def write_game(self, payload: dict) -> str:
         doc: dict[str, Any] = dict(payload)

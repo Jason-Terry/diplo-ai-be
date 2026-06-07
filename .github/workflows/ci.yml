@@ -16,4 +16,15 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
-      - run: uv run ruff check backend/
+      - run: uv run ruff check backend/ tests/
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest
