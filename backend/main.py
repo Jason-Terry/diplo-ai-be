@@ -26,7 +26,7 @@ from backend.account import (
     router as account_router,
 )
 from backend.auth import current_user_verified, router as auth_router
-from backend.byok import encrypt_key, decrypt_key, PROVIDERS
+from backend.byok import PROVIDERS
 from backend.eval_log import list_games, read_game, write_game_log
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry

@@ -329,7 +329,6 @@ Set `end_call: true` when you want to close the call (and explain in `end_reason
         inbox,
         stream_callback=None,
     ):
-        phase = game_state["turn"]["phase"]
         phase_type = game_state["turn"].get("type", "M")
 
         if phase_type == "A":

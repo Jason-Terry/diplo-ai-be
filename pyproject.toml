@@ -66,3 +66,14 @@ test   = "pytest"
 
 # ── Bootstrap (first-time setup once Podman is initialised) ───────────────────
 setup = ["db:up"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Ruff
+#
+# main.py deliberately calls logging.basicConfig() before importing modules
+# that build their own loggers at import time, so its imports can't all live
+# at the top of the file.
+# ──────────────────────────────────────────────────────────────────────────────
+[tool.ruff.lint.per-file-ignores]
+"backend/main.py" = ["E402"]

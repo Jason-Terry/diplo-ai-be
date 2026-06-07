@@ -596,10 +596,11 @@ class DiplomacyEngine:
         return headlines
 
     def _resolve_commitment(self, commitment: dict, orders: List[str]) -> bool:
-        """Return True if the commitment was kept based on the orders actually issued."""
+        """Return True if the commitment was kept based on the orders actually issued.
+        Resolution is structured-only (type + target) — the free-form `text`
+        field is just a human-readable label, not used by the matcher."""
         c_type = (commitment.get("type") or "").lower()
         target = (commitment.get("target") or "").upper()
-        text = commitment.get("text", "")
         # If we can't interpret the structured type, fall back to None (unknown).
         if c_type == "no_move" and target:
             for o in orders:
