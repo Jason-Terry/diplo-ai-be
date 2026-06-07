@@ -104,43 +104,80 @@ class Agent:
         self.persona = persona or {}
         self.api_key = api_key
 
+    async def _one_completion(self, messages, stream_callback, channel):
+        """Single LiteLLM streaming call. Returns the full concatenated text.
+        Streaming exceptions propagate so the caller can decide whether to retry."""
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 2500,
+        }
+        if self.api_key:
+            # LiteLLM honours per-call api_key for all the providers we
+            # care about (Anthropic, OpenAI, Gemini).
+            kwargs["api_key"] = self.api_key
+        response = await litellm.acompletion(**kwargs)
+        full = ""
+        async for chunk in response:
+            content = chunk.choices[0].delta.content
+            if not content:
+                continue
+            full += content
+            if stream_callback:
+                await stream_callback(self.power, content, channel)
+        return full
+
     async def _stream_and_parse(self, prompt, stream_callback, channel):
+        """Stream a completion and parse the JSON payload out of it. If the
+        first response can't be parsed (model wandered off-format, fence
+        mismatched, etc.) re-ask once with a tight repair prompt before
+        giving up — silently returning {} causes a power to forfeit a phase."""
         logger.info("LLM call start power=%s channel=%s model=%s", self.power, channel, self.model)
+        messages = [{"role": "user", "content": prompt}]
         try:
-            kwargs = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": True,
-                "max_tokens": 2500,
-            }
-            if self.api_key:
-                # LiteLLM honours per-call api_key for all the providers we
-                # care about (Anthropic, OpenAI, Gemini).
-                kwargs["api_key"] = self.api_key
-            response = await litellm.acompletion(**kwargs)
-            full = ""
-            async for chunk in response:
-                content = chunk.choices[0].delta.content
-                if not content:
-                    continue
-                full += content
-                if stream_callback:
-                    await stream_callback(self.power, content, channel)
-            blob = _extract_json_blob(full) or {}
-            if not blob:
-                logger.warning(
-                    "LLM returned no parseable JSON power=%s channel=%s raw_len=%d raw_head=%r",
-                    self.power, channel, len(full), full[:300],
-                )
-            else:
-                logger.info("LLM call ok power=%s channel=%s raw_len=%d keys=%s", self.power, channel, len(full), list(blob.keys()))
-            return blob, full
+            full = await self._one_completion(messages, stream_callback, channel)
         except Exception as exc:  # noqa: BLE001
             logger.exception("LLM call failed power=%s channel=%s model=%s", self.power, channel, self.model)
             err = f"[Error: {exc}]"
             if stream_callback:
                 await stream_callback(self.power, err, channel)
             return {}, err
+
+        blob = _extract_json_blob(full)
+        if blob:
+            logger.info("LLM call ok power=%s channel=%s raw_len=%d keys=%s", self.power, channel, len(full), list(blob.keys()))
+            return blob, full
+
+        logger.warning(
+            "LLM returned no parseable JSON power=%s channel=%s raw_len=%d raw_head=%r — retrying",
+            self.power, channel, len(full), full[:300],
+        )
+        # Repair attempt — hand the model its own (bad) reply back and ask
+        # for JSON only. Cheaper than burning the phase.
+        repair_messages = messages + [
+            {"role": "assistant", "content": full},
+            {"role": "user", "content": (
+                "Your previous reply could not be parsed as JSON. "
+                "Reply again with ONLY the JSON object — no prose, no fence, "
+                "no commentary. Same schema as before."
+            )},
+        ]
+        try:
+            full2 = await self._one_completion(repair_messages, stream_callback, channel)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("LLM repair call failed power=%s channel=%s", self.power, channel)
+            return {}, f"[Error: {exc}]"
+
+        blob2 = _extract_json_blob(full2) or {}
+        if blob2:
+            logger.info("LLM repair ok power=%s channel=%s keys=%s", self.power, channel, list(blob2.keys()))
+        else:
+            logger.warning(
+                "LLM repair also unparseable power=%s channel=%s raw_head=%r",
+                self.power, channel, full2[:300],
+            )
+        return blob2, full2
 
     async def negotiate(
         self,

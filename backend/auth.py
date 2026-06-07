@@ -56,12 +56,20 @@ GITHUB_STATE_TTL_SECONDS = 60 * 10  # 10 min
 
 def _jwt_secret() -> str:
     s = os.environ.get("JWT_SECRET", "").strip()
-    if not s:
-        # Dev fallback. NEVER rely on this in prod — restart-stable secret comes
-        # from the env var.
-        logger.warning("JWT_SECRET is unset; using a transient dev secret")
-        return "dev-insecure-secret-do-not-use-in-prod"
-    return s
+    if s:
+        return s
+    # Fail closed when we can detect we're in a hosted env — a missing secret
+    # there would let any caller forge sessions, and the dev fallback below
+    # would silently make that work. Railway sets RAILWAY_ENVIRONMENT on every
+    # service, so its presence is a reliable "not on my laptop" signal.
+    if os.environ.get("RAILWAY_ENVIRONMENT", "").strip():
+        raise RuntimeError(
+            "JWT_SECRET is unset in a hosted environment. "
+            "Generate one with `python -c 'import secrets; print(secrets.token_urlsafe(64))'` "
+            "and set it as a Railway variable before this service can boot."
+        )
+    logger.warning("JWT_SECRET is unset; using a transient dev secret")
+    return "dev-insecure-secret-do-not-use-in-prod"
 
 
 def _jwt_ttl_seconds() -> int:
@@ -389,22 +397,7 @@ def verify(token: str) -> RedirectResponse:
         return RedirectResponse(url=f"{fe_url}/#/?verify=missing")
 
     backend = get_user_backend()
-    # Linear scan is fine for low-volume; the Mongo backend will index this later.
-    found = None
-    if isinstance(backend, type) is False:  # always true; just for the logger.exception path below
-        # Use a generic accessor since UserBackend doesn't expose a query API.
-        # For both backends, the cheapest correct path is a list/scan.
-        # FileBackend already scans on every find_by_email; Mongo case below.
-        from backend.auth_store import MongoUserBackend
-        if isinstance(backend, MongoUserBackend):
-            found = backend.users.find_one({"verification_token": token})
-        else:
-            from backend.auth_store import FileUserBackend
-            if isinstance(backend, FileUserBackend):
-                for u in backend._load().values():
-                    if u.get("verification_token") == token:
-                        found = u
-                        break
+    found = backend.find_one_by_field("verification_token", token)
 
     if not found:
         return RedirectResponse(url=f"{fe_url}/#/?verify=invalid")
@@ -434,15 +427,7 @@ def resend_verification(user: dict = Depends(current_user)) -> dict:
 
 def _find_user_by_reset_token(token: str) -> Optional[dict]:
     """Backend-agnostic lookup. Mirrors the scan path used by /verify."""
-    backend = get_user_backend()
-    from backend.auth_store import FileUserBackend, MongoUserBackend
-    if isinstance(backend, MongoUserBackend):
-        return backend.users.find_one({"reset_token": token})
-    if isinstance(backend, FileUserBackend):
-        for u in backend._load().values():
-            if u.get("reset_token") == token:
-                return u
-    return None
+    return get_user_backend().find_one_by_field("reset_token", token)
 
 
 @router.post("/forgot-password")
@@ -670,15 +655,7 @@ def _gh_primary_verified_email(emails: list) -> Optional[str]:
 
 
 def _gh_lookup_by_id(github_id: str) -> Optional[dict]:
-    backend = get_user_backend()
-    from backend.auth_store import FileUserBackend, MongoUserBackend
-    if isinstance(backend, MongoUserBackend):
-        return backend.users.find_one({"github_id": github_id})
-    if isinstance(backend, FileUserBackend):
-        for u in backend._load().values():
-            if u.get("github_id") == github_id:
-                return u
-    return None
+    return get_user_backend().find_one_by_field("github_id", github_id)
 
 
 def _gh_pick_username(suggested: str) -> str:

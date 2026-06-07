@@ -542,6 +542,25 @@ async def adjudicate_turn(game_id: str):
 
 @app.get("/")
 async def root():
+    """Railway healthcheck. Verifies Mongo is reachable so a dead DB takes
+    the service out of rotation instead of letting it serve 500s. The ping
+    is cheap (no auth, no read) and bounded by pymongo's default
+    socketTimeoutMS, but we still narrow the response so a slow Mongo
+    can't wedge the healthcheck for the full default timeout."""
+    from backend.auth_store import FileUserBackend, MongoUserBackend, get_user_backend
+    backend = get_user_backend()
+    if isinstance(backend, MongoUserBackend):
+        try:
+            backend.client.admin.command("ping")
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).exception("healthcheck mongo ping failed")
+            return JSONResponse(
+                {"service": "diplo-ai-be", "ok": False, "error": f"mongo: {exc}"},
+                status_code=503,
+            )
+    elif isinstance(backend, FileUserBackend):
+        # File backend has no remote dep to check; presence implies fine.
+        pass
     return {"service": "diplo-ai-be", "ok": True}
 
 

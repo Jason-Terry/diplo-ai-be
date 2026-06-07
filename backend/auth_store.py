@@ -55,6 +55,13 @@ class UserBackend(ABC):
     @abstractmethod
     def update_user(self, user_id: str, patch: dict) -> Optional[dict]: ...
 
+    @abstractmethod
+    def find_one_by_field(self, field: str, value: str) -> Optional[dict]:
+        """Single-record lookup by an arbitrary field. Used by token flows
+        (verification, password reset, github_id lookup) so callers don't
+        have to reach into backend internals or duplicate the scan logic."""
+        ...
+
 
 # ─── File backend ────────────────────────────────────────────────────────────
 
@@ -119,6 +126,12 @@ class FileUserBackend(UserBackend):
             self._save(users)
             return users[user_id]
 
+    def find_one_by_field(self, field: str, value: str) -> Optional[dict]:
+        for u in self._load().values():
+            if u.get(field) == value:
+                return u
+        return None
+
 
 # ─── Mongo backend ───────────────────────────────────────────────────────────
 
@@ -156,6 +169,9 @@ class MongoUserBackend(UserBackend):
             {"_id": user_id}, {"$set": patch}, return_document=True
         )
         return result
+
+    def find_one_by_field(self, field: str, value: str) -> Optional[dict]:
+        return self.users.find_one({field: value})
 
 
 # ─── Factory ────────────────────────────────────────────────────────────────
