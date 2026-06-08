@@ -35,7 +35,13 @@ from backend.auth import (
 )
 from backend.auth_store import get_user_backend
 from backend.byok import PROVIDERS
-from backend.eval_log import backfill_owner_id, list_games, read_game, write_game_log
+from backend.eval_log import (
+    backfill_owner_id,
+    backfill_terminal_status,
+    list_games,
+    read_game,
+    write_game_log,
+)
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
 from backend.policies import (
@@ -100,28 +106,41 @@ app.include_router(account_router)
 
 
 @app.on_event("startup")
-def _backfill_legacy_owner_ids() -> None:
-    """One-time migration: stamp any persisted game without an owner_id with
-    the first admin user we find. Pre-ownership games would otherwise be
-    inaccessible after the ownership gate goes live (every read path 404s
-    on owner mismatch). Safe to re-run — backfill_owner_id only touches
-    records that have no owner."""
+def _run_migrations() -> None:
+    """One-time, idempotent migrations:
+
+    1. owner_id backfill: stamp every game without an owner with the first
+       admin user. Pre-ownership games would otherwise 404 on every read
+       (every endpoint now requires owner match).
+    2. terminal_status backfill: stamp every game without a status as either
+       "complete" (engine says is_complete) or "active" (still running).
+       Required before phase endpoints can enforce the active-only gate.
+
+    Both helpers only touch records missing the target field — safe to
+    re-run on every boot."""
     log = logging.getLogger("backend.main.migration")
     try:
         admin = get_user_backend().find_one_by_field("is_admin", True)
     except Exception:  # noqa: BLE001
-        log.exception("backfill: failed to look up admin user; skipping")
-        return
-    if not admin:
+        log.exception("backfill: admin lookup failed; skipping owner_id pass")
+        admin = None
+
+    if admin:
+        try:
+            n = backfill_owner_id(admin["_id"])
+            if n:
+                log.info("backfill: stamped %d legacy game(s) with owner=%s", n, admin["_id"])
+        except Exception:  # noqa: BLE001
+            log.exception("backfill: owner_id write failed; skipping")
+    else:
         log.info("backfill: no admin user — leaving legacy games owner-less")
-        return
+
     try:
-        n = backfill_owner_id(admin["_id"])
+        n = backfill_terminal_status()
+        if n:
+            log.info("backfill: stamped terminal_status on %d legacy game(s)", n)
     except Exception:  # noqa: BLE001
-        log.exception("backfill: write failed; skipping")
-        return
-    if n:
-        log.info("backfill: stamped %d legacy game(s) with owner=%s", n, admin["_id"])
+        log.exception("backfill: terminal_status write failed; skipping")
 
 
 class GameSlot(BaseModel):
@@ -240,6 +259,19 @@ def _require_owned_game(game_id: str, user: dict) -> Game:
     return game
 
 
+def _require_active_game(game_id: str, user: dict) -> Game:
+    """As _require_owned_game, but additionally rejects frozen games. Phase
+    endpoints use this so a completed / errored / abandoned game can't be
+    advanced further — 409 (state conflict), not 404."""
+    game = _require_owned_game(game_id, user)
+    if game.terminal_status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"game is {game.terminal_status} — no further phases can run",
+        )
+    return game
+
+
 def _living_powers(game: Game) -> List[str]:
     return [name for name, p in game.engine.game.powers.items() if p.units or p.centers]
 
@@ -250,7 +282,12 @@ def _persist(game: Game) -> str | None:
     state change (create + each phase action) so list_games reflects reality
     and any in-progress game survives a process restart."""
     try:
-        return write_game_log(game.engine, game.agent_config, owner_id=game.owner_id)
+        return write_game_log(
+            game.engine,
+            game.agent_config,
+            owner_id=game.owner_id,
+            terminal_status=game.terminal_status,
+        )
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
         return None
@@ -423,7 +460,7 @@ async def _run_call(game: Game, call: dict, board_state: dict):
 
 @app.post("/api/games/{game_id}/phase/negotiate")
 async def run_negotiation(game_id: str, user: dict = Depends(current_user_verified)):
-    game = _require_owned_game(game_id, user)
+    game = _require_active_game(game_id, user)
     if not game.agents:
         return {"status": "error", "error": "Game not initialized"}
     state = game.engine.get_state()
@@ -546,7 +583,7 @@ async def run_negotiation(game_id: str, user: dict = Depends(current_user_verifi
 
 @app.post("/api/games/{game_id}/phase/orders")
 async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
-    game = _require_owned_game(game_id, user)
+    game = _require_active_game(game_id, user)
     if not game.agents:
         return {"status": "error", "error": "Game not initialized"}
     state = game.engine.get_state()
@@ -598,12 +635,23 @@ async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
 
 @app.post("/api/games/{game_id}/phase/adjudicate")
 async def adjudicate_turn(game_id: str, user: dict = Depends(current_user_verified)):
-    game = _require_owned_game(game_id, user)
+    game = _require_active_game(game_id, user)
     result = game.engine.process_turn()
+    # If adjudication declared a winner / draw / forced end, freeze the game
+    # so no further phase calls can advance it and analytics can filter to
+    # finished matches. Other terminal transitions (errored / abandoned /
+    # stalled) land in later slices.
+    if game.engine.get_state().get("is_complete"):
+        game.terminal_status = "complete"
+        await game.manager.broadcast({
+            "type": "game_terminal",
+            "terminal_status": "complete",
+            "winner": game.engine.get_state().get("winner"),
+        })
     if _persist(game) is None:
         result["log_warning"] = "persist failed (see backend logs)"
     await game.manager.broadcast({"type": "adjudicated", **result})
-    return {"status": "ok", **result}
+    return {"status": "ok", "terminal_status": game.terminal_status, **result}
 
 
 @app.get("/")

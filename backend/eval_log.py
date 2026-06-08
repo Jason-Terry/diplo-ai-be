@@ -14,11 +14,18 @@ def write_game_log(
     engine,
     agents_config: Dict[str, dict],
     owner_id: Optional[str] = None,
+    terminal_status: str = "active",
 ) -> str:
+    """Persist a game snapshot.
+
+    `terminal_status` is the lifecycle label (active / complete / errored /
+    abandoned / stalled). The auto-transition to "complete" lives in
+    main.py's adjudicate handler; other transitions land in later slices."""
     state = engine.get_state()
     payload = {
         "game_id": engine.game_id,
         "owner_id": owner_id,
+        "terminal_status": terminal_status,
         "started_at": engine.started_at,
         "updated_at": time.time(),
         "agents_config": agents_config,
@@ -51,3 +58,10 @@ def backfill_owner_id(owner_id: str) -> int:
     """Stamp owner_id onto every persisted game that doesn't have one yet.
     Returns the number of records updated. Idempotent."""
     return get_backend().backfill_owner_id(owner_id)
+
+
+def backfill_terminal_status() -> int:
+    """Stamp terminal_status onto every persisted game that doesn't have
+    one yet — set to "complete" if the engine already flagged is_complete,
+    else "active". Idempotent."""
+    return get_backend().backfill_terminal_status()

@@ -41,12 +41,24 @@ class LogBackend(ABC):
         records are NOT touched."""
         ...
 
+    @abstractmethod
+    def backfill_terminal_status(self) -> int:
+        """Stamp terminal_status on every record missing it: "complete" if
+        the engine already flagged is_complete, else "active". Idempotent."""
+        ...
+
 
 def _summarize(doc: dict) -> dict:
-    """Project a full game document to the index-row fields."""
+    """Project a full game document to the index-row fields. terminal_status
+    falls back to a derivation from is_complete for legacy docs that haven't
+    been touched by the backfill yet."""
+    status = doc.get("terminal_status")
+    if not status:
+        status = "complete" if doc.get("is_complete") else "active"
     return {
         "game_id": doc.get("game_id"),
         "owner_id": doc.get("owner_id"),
+        "terminal_status": status,
         "winner": doc.get("winner"),
         "is_complete": doc.get("is_complete"),
         "turns": len(doc.get("turns", [])),
@@ -124,6 +136,29 @@ class FileBackend(LogBackend):
             n += 1
         return n
 
+    def backfill_terminal_status(self) -> int:
+        if not os.path.isdir(self.logs_dir):
+            return 0
+        n = 0
+        for fname in os.listdir(self.logs_dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(self.logs_dir, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            if doc.get("terminal_status"):
+                continue
+            doc["terminal_status"] = "complete" if doc.get("is_complete") else "active"
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, default=str)
+            os.replace(tmp, path)
+            n += 1
+        return n
+
 
 # ─── Mongo backend ───────────────────────────────────────────────────────────
 
@@ -158,6 +193,7 @@ class MongoBackend(LogBackend):
             projection={
                 "game_id": 1,
                 "owner_id": 1,
+                "terminal_status": 1,
                 "winner": 1,
                 "is_complete": 1,
                 "turns": 1,
@@ -180,6 +216,25 @@ class MongoBackend(LogBackend):
             {"$set": {"owner_id": owner_id}},
         )
         return int(result.modified_count)
+
+    def backfill_terminal_status(self) -> int:
+        # Two passes — completed games become "complete"; everything else
+        # becomes "active". Both passes filter on missing status so they're
+        # idempotent. Order matters: complete first, so already-complete games
+        # don't get mislabeled active on a second pass.
+        missing_status = {"$or": [
+            {"terminal_status": {"$exists": False}},
+            {"terminal_status": None},
+        ]}
+        completed = self.games.update_many(
+            {"$and": [missing_status, {"is_complete": True}]},
+            {"$set": {"terminal_status": "complete"}},
+        )
+        active = self.games.update_many(
+            {"$and": [missing_status, {"$or": [{"is_complete": {"$exists": False}}, {"is_complete": False}]}]},
+            {"$set": {"terminal_status": "active"}},
+        )
+        return int(completed.modified_count) + int(active.modified_count)
 
 
 # ─── Factory ────────────────────────────────────────────────────────────────

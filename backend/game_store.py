@@ -56,7 +56,12 @@ class Game:
 
     `owner_id` is the user-id of the account that created the game. Used by
     main.py to gate every read/write path so users can't read each other's
-    matches over the API or the WS feed."""
+    matches over the API or the WS feed.
+
+    `terminal_status` is the lifecycle label — "active" while the game can
+    still advance, terminal states ("complete" / "errored" / "abandoned" /
+    "stalled") freeze the game out of further phase calls. Stays in lockstep
+    with the persisted record."""
 
     def __init__(
         self,
@@ -64,11 +69,13 @@ class Game:
         agents: Dict[str, Agent],
         agent_config: Dict[str, Dict[str, str]],
         owner_id: Optional[str] = None,
+        terminal_status: str = "active",
     ) -> None:
         self.engine = engine
         self.agents = agents
         self.agent_config = agent_config
         self.owner_id = owner_id
+        self.terminal_status = terminal_status
         self.manager = ConnectionManager()
         self.last_used = time.time()
 
@@ -155,11 +162,24 @@ class GameRegistry:
             return None
         agents_config = doc.get("agents_config") or {}
         agents = _build_agents(agents_config)
-        game = Game(engine, agents, agents_config, owner_id=doc.get("owner_id"))
+        # Legacy docs predate terminal_status — derive on the fly so an LRU
+        # rehydrate of a pre-migration record doesn't default everything to
+        # "active" when the engine has already completed.
+        status = doc.get("terminal_status")
+        if not status:
+            status = "complete" if doc.get("is_complete") else "active"
+        game = Game(
+            engine,
+            agents,
+            agents_config,
+            owner_id=doc.get("owner_id"),
+            terminal_status=status,
+        )
         self._games[game_id] = game
         self._games.move_to_end(game_id)
         self._evict_if_needed()
-        logger.info("game rehydrated id=%s owner=%s phase=%s", game_id, game.owner_id, engine.game.phase)
+        logger.info("game rehydrated id=%s owner=%s phase=%s status=%s",
+                    game_id, game.owner_id, engine.game.phase, game.terminal_status)
         return game
 
     def drop(self, game_id: str) -> None:
