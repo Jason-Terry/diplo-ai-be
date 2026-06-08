@@ -260,6 +260,11 @@ class UserOut(BaseModel):
     # gate so we can demo/dogfood the free-trial bundle without burning the
     # one allotment per pass.
     is_admin: bool = False
+    # Refund counters for the broken-game retry flow. FE switches the
+    # modal copy from "try again" to "please report on GitHub" once the
+    # used count reaches the limit.
+    refunds_used: int = 0
+    refunds_limit: int = 3
 
 
 def _to_user_out(doc: dict) -> UserOut:
@@ -273,7 +278,15 @@ def _to_user_out(doc: dict) -> UserOut:
         github_login=doc.get("github_login") or None,
         has_password=bool(doc.get("hashed_password")),
         is_admin=bool(doc.get("is_admin")),
+        refunds_used=int(doc.get("refunds_used") or 0),
+        refunds_limit=REFUND_LIMIT,
     )
+
+
+# Lifetime cap on user-triggered "this game is broken, give me a fresh
+# one" requests. Past this, the FE shows the GitHub-issues link instead
+# of a Try Again button. Bypassed for admins (project owner).
+REFUND_LIMIT = 3
 
 
 # ─── Dependencies ────────────────────────────────────────────────────────────

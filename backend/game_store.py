@@ -70,12 +70,16 @@ class Game:
         agent_config: Dict[str, Dict[str, str]],
         owner_id: Optional[str] = None,
         terminal_status: str = "active",
+        free_trial: bool = False,
     ) -> None:
         self.engine = engine
         self.agents = agents
         self.agent_config = agent_config
         self.owner_id = owner_id
         self.terminal_status = terminal_status
+        # free_trial gates the refund flow — only free-trial games can be
+        # one-click-retried because the BYOK case has no counter to refund.
+        self.free_trial = free_trial
         self.manager = ConnectionManager()
         self.last_used = time.time()
 
@@ -124,18 +128,26 @@ class GameRegistry:
         self._games: "OrderedDict[str, Game]" = OrderedDict()
         self._max = max_in_memory
 
-    def create(self, agents_config: Dict[str, dict], owner_id: str) -> Game:
+    def create(
+        self,
+        agents_config: Dict[str, dict],
+        owner_id: str,
+        free_trial: bool = False,
+    ) -> Game:
         """Caller (the /api/games endpoint) is responsible for resolving each
         slot to its persisted shape (model + persona snapshot + encrypted
         key). We don't transform here so the caller is the single source of
         truth for the new BYOK contract."""
         engine = DiplomacyEngine()
         agents = _build_agents(agents_config)
-        game = Game(engine, agents, agents_config, owner_id=owner_id)
+        game = Game(engine, agents, agents_config, owner_id=owner_id, free_trial=free_trial)
         self._games[game.game_id] = game
         self._games.move_to_end(game.game_id)
         self._evict_if_needed()
-        logger.info("game created id=%s owner=%s powers=%s", game.game_id, owner_id, list(agents.keys()))
+        logger.info(
+            "game created id=%s owner=%s free_trial=%s powers=%s",
+            game.game_id, owner_id, free_trial, list(agents.keys()),
+        )
         return game
 
     def get(self, game_id: str) -> Optional[Game]:
@@ -174,6 +186,7 @@ class GameRegistry:
             agents_config,
             owner_id=doc.get("owner_id"),
             terminal_status=status,
+            free_trial=bool(doc.get("free_trial")),
         )
         self._games[game_id] = game
         self._games.move_to_end(game_id)

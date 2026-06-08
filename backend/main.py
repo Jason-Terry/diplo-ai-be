@@ -29,6 +29,7 @@ from backend.account import (
 )
 from backend.auth import (
     COOKIE_NAME,
+    REFUND_LIMIT,
     current_user_verified,
     decode_jwt,
     router as auth_router,
@@ -316,11 +317,12 @@ async def list_all_games(user: dict = Depends(current_user_verified)):
 @app.post("/api/games")
 async def create_game(body: CreateGameIn, user: dict = Depends(current_user_verified)):
     agents_config = _build_agents_config(user, body)
-    game = registry.create(agents_config, owner_id=user["_id"])
+    is_free_trial = body.preset_id == FREE_TRIAL_PRESET_ID
+    game = registry.create(agents_config, owner_id=user["_id"], free_trial=is_free_trial)
     # Free-trial bookkeeping AFTER the game registers — if registry.create
     # blew up we shouldn't burn the user's one trial. Admins never consume
     # the counter (they have unlimited Haiku + Wildcard).
-    if body.preset_id == FREE_TRIAL_PRESET_ID and not is_admin(user):
+    if is_free_trial and not is_admin(user):
         increment_free_trial(user)
     _persist(game)  # appear in /api/games immediately
     # Strip the encrypted key when broadcasting / returning so it never
@@ -347,6 +349,8 @@ async def get_state(game_id: str, user: dict = Depends(current_user_verified)):
     game = _require_owned_game(game_id, user)
     state = game.engine.get_state()
     state["game_id"] = game_id
+    state["terminal_status"] = game.terminal_status
+    state["free_trial"] = game.free_trial
     # Never expose the encrypted key over the API — even ciphertext leaks
     # narrow attacker time budget for offline brute-forcing.
     state["agents_config"] = {
@@ -631,6 +635,70 @@ async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
     _persist(game)
     await game.manager.broadcast({"type": "phase_end", "phase": "orders"})
     return {"status": "ok", "phase_step": game.engine.phase_step, "summary": summary}
+
+
+@app.post("/api/games/{game_id}/refund")
+async def refund_game(game_id: str, user: dict = Depends(current_user_verified)):
+    """One-click recovery for a free-trial game that's stuck or broken.
+
+    Invalidates the current game (terminal_status='refunded' — hidden from
+    /api/games), bumps refunds_used, and spins up a fresh game with the
+    same agents_config. Capped at REFUND_LIMIT per user (admins bypass).
+    BYOK games are not eligible — their owners can just hit New Game,
+    there's no counter to refund."""
+    game = _require_owned_game(game_id, user)
+
+    if not game.free_trial:
+        raise HTTPException(
+            status_code=403,
+            detail="Refund flow is only available for free-trial games. "
+                   "Start a new game from the dashboard.",
+        )
+    if game.terminal_status in ("complete", "refunded"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot refund a {game.terminal_status} game",
+        )
+
+    refunds_used = int(user.get("refunds_used") or 0)
+    if not is_admin(user) and refunds_used >= REFUND_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Refund limit reached. Please report the issue at "
+                "https://github.com/Jason-Terry/diplo-ai-be/issues so we can take a look."
+            ),
+        )
+
+    # Mark + persist the old game first; if anything blows up later, the
+    # user can still see they didn't end up double-billed for the broken
+    # game. The new-game creation is the "actual" cost path.
+    game.terminal_status = "refunded"
+    _persist(game)
+    await game.manager.broadcast({"type": "game_terminal", "terminal_status": "refunded"})
+
+    new_game = registry.create(
+        game.agent_config,
+        owner_id=user["_id"],
+        free_trial=True,  # always a free trial — that's what the refund is "of"
+    )
+    _persist(new_game)
+    safe_config = {p: {k: v for k, v in c.items() if k != "api_key_cipher"}
+                   for p, c in (game.agent_config or {}).items()}
+    await new_game.manager.broadcast({"type": "game_started", "config": safe_config})
+
+    # Bump the counter last — only admins skip, since they get unlimited
+    # retries for dogfooding.
+    if not is_admin(user):
+        new_used = refunds_used + 1
+        get_user_backend().update_user(user["_id"], {"refunds_used": new_used})
+        refunds_used = new_used
+
+    return {
+        "new_game_id": new_game.game_id,
+        "refunds_used": refunds_used,
+        "refunds_limit": REFUND_LIMIT,
+    }
 
 
 @app.post("/api/games/{game_id}/phase/adjudicate")

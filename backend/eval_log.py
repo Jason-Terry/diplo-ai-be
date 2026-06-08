@@ -15,17 +15,23 @@ def write_game_log(
     agents_config: Dict[str, dict],
     owner_id: Optional[str] = None,
     terminal_status: str = "active",
+    free_trial: bool = False,
 ) -> str:
     """Persist a game snapshot.
 
-    `terminal_status` is the lifecycle label (active / complete / errored /
-    abandoned / stalled). The auto-transition to "complete" lives in
-    main.py's adjudicate handler; other transitions land in later slices."""
+    `terminal_status` — lifecycle label (active / complete / errored /
+    abandoned / stalled / refunded). Auto-transition to "complete" lives
+    in main.py's adjudicate handler. "refunded" is set by the refund
+    endpoint when a user invalidates a broken game.
+
+    `free_trial` — True iff this game was created via the
+    __free_trial__ preset. Gates eligibility for the refund flow."""
     state = engine.get_state()
     payload = {
         "game_id": engine.game_id,
         "owner_id": owner_id,
         "terminal_status": terminal_status,
+        "free_trial": free_trial,
         "started_at": engine.started_at,
         "updated_at": time.time(),
         "agents_config": agents_config,

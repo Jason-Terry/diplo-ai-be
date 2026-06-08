@@ -59,6 +59,7 @@ def _summarize(doc: dict) -> dict:
         "game_id": doc.get("game_id"),
         "owner_id": doc.get("owner_id"),
         "terminal_status": status,
+        "free_trial": bool(doc.get("free_trial")),
         "winner": doc.get("winner"),
         "is_complete": doc.get("is_complete"),
         "turns": len(doc.get("turns", [])),
@@ -102,6 +103,10 @@ class FileBackend(LogBackend):
             except Exception:
                 continue
             if owner_id is not None and doc.get("owner_id") != owner_id:
+                continue
+            # Refunded games are intentionally hidden — the user invalidated
+            # them and they have a replacement game already.
+            if doc.get("terminal_status") == "refunded":
                 continue
             out.append(_summarize(doc))
         return out
@@ -187,13 +192,17 @@ class MongoBackend(LogBackend):
         return doc["_id"]
 
     def list_games(self, owner_id: str | None = None) -> list[dict]:
-        query: dict = {} if owner_id is None else {"owner_id": owner_id}
+        # Refunded games are hidden — they were invalidated and replaced.
+        query: dict = {"terminal_status": {"$ne": "refunded"}}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
         cursor = self.games.find(
             query,
             projection={
                 "game_id": 1,
                 "owner_id": 1,
                 "terminal_status": 1,
+                "free_trial": 1,
                 "winner": 1,
                 "is_complete": 1,
                 "turns": 1,
