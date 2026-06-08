@@ -16,6 +16,7 @@ def write_game_log(
     owner_id: Optional[str] = None,
     terminal_status: str = "active",
     free_trial: bool = False,
+    failed_phase_count: int = 0,
 ) -> str:
     """Persist a game snapshot.
 
@@ -25,13 +26,18 @@ def write_game_log(
     endpoint when a user invalidates a broken game.
 
     `free_trial` — True iff this game was created via the
-    __free_trial__ preset. Gates eligibility for the refund flow."""
+    __free_trial__ preset. Gates eligibility for the refund flow.
+
+    `failed_phase_count` — consecutive phases where no agent produced
+    meaningful output. Reset to 0 on any successful phase. Crossing
+    the threshold flips terminal_status to 'errored'."""
     state = engine.get_state()
     payload = {
         "game_id": engine.game_id,
         "owner_id": owner_id,
         "terminal_status": terminal_status,
         "free_trial": free_trial,
+        "failed_phase_count": failed_phase_count,
         "started_at": engine.started_at,
         "updated_at": time.time(),
         "agents_config": agents_config,

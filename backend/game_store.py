@@ -71,6 +71,7 @@ class Game:
         owner_id: Optional[str] = None,
         terminal_status: str = "active",
         free_trial: bool = False,
+        failed_phase_count: int = 0,
     ) -> None:
         self.engine = engine
         self.agents = agents
@@ -80,6 +81,10 @@ class Game:
         # free_trial gates the refund flow — only free-trial games can be
         # one-click-retried because the BYOK case has no counter to refund.
         self.free_trial = free_trial
+        # Consecutive phases with zero agent output. Bumps in main.py after
+        # each phase gather; resets on any meaningful result. Crossing
+        # FAILED_PHASE_THRESHOLD trips terminal_status to "errored".
+        self.failed_phase_count = failed_phase_count
         self.manager = ConnectionManager()
         self.last_used = time.time()
 
@@ -187,6 +192,7 @@ class GameRegistry:
             owner_id=doc.get("owner_id"),
             terminal_status=status,
             free_trial=bool(doc.get("free_trial")),
+            failed_phase_count=int(doc.get("failed_phase_count") or 0),
         )
         self._games[game_id] = game
         self._games.move_to_end(game_id)

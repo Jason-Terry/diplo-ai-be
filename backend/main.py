@@ -288,10 +288,66 @@ def _persist(game: Game) -> str | None:
             game.agent_config,
             owner_id=game.owner_id,
             terminal_status=game.terminal_status,
+            free_trial=game.free_trial,
+            failed_phase_count=game.failed_phase_count,
         )
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
         return None
+
+
+# Two consecutive empty phases is the threshold. Single bad phase often
+# clears up (transient provider 5xx, one-shot JSON malformedness — already
+# retried once at the agent layer); two in a row is the signal that the
+# game can't make forward progress and should be offered for refund.
+FAILED_PHASE_THRESHOLD = 2
+
+
+def _phase_had_any_output(results: list) -> bool:
+    """Did at least one agent in a phase produce meaningful output?
+
+    `results` is the list returned by asyncio.gather(..., return_exceptions=True)
+    over per-power agent calls. An item is either an Exception or a
+    (power, payload) tuple. We treat a power as "produced output" if its
+    payload has any of: thought, orders, messages, notes_to_save.
+
+    Used by the auto-error guard to detect total-failure phases."""
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        _, payload = item
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("thought")
+            or payload.get("orders")
+            or payload.get("messages")
+            or payload.get("notes_to_save")
+        ):
+            return True
+    return False
+
+
+async def _record_phase_outcome(game: Game, results: list) -> None:
+    """Update failed_phase_count and flip terminal_status when the
+    threshold is crossed. Safe to call after every phase gather."""
+    if _phase_had_any_output(results):
+        game.failed_phase_count = 0
+        return
+    game.failed_phase_count += 1
+    logging.getLogger(__name__).warning(
+        "phase had no agent output game_id=%s count=%d",
+        game.game_id, game.failed_phase_count,
+    )
+    if game.failed_phase_count >= FAILED_PHASE_THRESHOLD and game.terminal_status == "active":
+        game.terminal_status = "errored"
+        await game.manager.broadcast({
+            "type": "game_terminal",
+            "terminal_status": "errored",
+            "reason": "consecutive_phase_failures",
+        })
 
 
 # ---------- Policies / config ----------
@@ -485,6 +541,7 @@ async def run_negotiation(game_id: str, user: dict = Depends(current_user_verifi
         "rounds": total_rounds, "calls_enabled": use_calls,
     })
 
+    all_round_results: list = []  # accumulate so a totally-empty phase trips the auto-error guard
     for round_index in range(total_rounds):
         await game.manager.broadcast({
             "type": "negotiation_round", "round": round_index, "total": total_rounds,
@@ -512,6 +569,7 @@ async def run_negotiation(game_id: str, user: dict = Depends(current_user_verifi
             return power, result
 
         results = await asyncio.gather(*(call_letter(p) for p in powers), return_exceptions=True)
+        all_round_results.extend(results)
 
         requested_calls = []
         for item in results:
@@ -574,11 +632,13 @@ async def run_negotiation(game_id: str, user: dict = Depends(current_user_verifi
             await asyncio.gather(*(_run_call(game, c, round_state) for c in batch))
 
     game.engine.phase_step = PhaseStep.ORDERS
+    await _record_phase_outcome(game, all_round_results)
     _persist(game)
     await game.manager.broadcast({"type": "phase_end", "phase": "negotiate"})
     return {
         "status": "ok",
         "phase_step": game.engine.phase_step,
+        "terminal_status": game.terminal_status,
         "rounds": total_rounds,
         "messages_count": len(game.engine.messages),
         "calls_count": len(game.engine.calls),
@@ -632,9 +692,15 @@ async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
         await game.manager.broadcast({"type": "orders_set", "power": power, **res})
 
     game.engine.phase_step = PhaseStep.ADJUDICATE
+    await _record_phase_outcome(game, results)
     _persist(game)
     await game.manager.broadcast({"type": "phase_end", "phase": "orders"})
-    return {"status": "ok", "phase_step": game.engine.phase_step, "summary": summary}
+    return {
+        "status": "ok",
+        "phase_step": game.engine.phase_step,
+        "terminal_status": game.terminal_status,
+        "summary": summary,
+    }
 
 
 @app.post("/api/games/{game_id}/refund")
