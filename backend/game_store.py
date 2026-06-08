@@ -72,6 +72,7 @@ class Game:
         terminal_status: str = "active",
         free_trial: bool = False,
         failed_phase_count: int = 0,
+        usage_by_power: Optional[Dict[str, Dict]] = None,
     ) -> None:
         self.engine = engine
         self.agents = agents
@@ -85,8 +86,28 @@ class Game:
         # each phase gather; resets on any meaningful result. Crossing
         # FAILED_PHASE_THRESHOLD trips terminal_status to "errored".
         self.failed_phase_count = failed_phase_count
+        # Running per-power token + cost totals. Each entry has the shape
+        # {input_tokens, output_tokens, total_tokens, cost_usd} and accumulates
+        # across every LLM call this game makes (negotiation, orders, calls,
+        # and any repair retries). For free-trial games the cost is on us
+        # but we still track it for our own spend telemetry.
+        self.usage_by_power: Dict[str, Dict] = usage_by_power or {}
         self.manager = ConnectionManager()
         self.last_used = time.time()
+
+    def record_usage(self, power: str, usage: Dict) -> None:
+        """Add a single LLM call's usage to this power's running total.
+        No-op when usage is empty (provider didn't report tokens)."""
+        if not usage:
+            return
+        cur = self.usage_by_power.get(power, {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+        })
+        cur["input_tokens"] = int(cur.get("input_tokens", 0)) + int(usage.get("input_tokens", 0))
+        cur["output_tokens"] = int(cur.get("output_tokens", 0)) + int(usage.get("output_tokens", 0))
+        cur["total_tokens"] = int(cur.get("total_tokens", 0)) + int(usage.get("total_tokens", 0))
+        cur["cost_usd"] = float(cur.get("cost_usd", 0.0)) + float(usage.get("cost_usd", 0.0))
+        self.usage_by_power[power] = cur
 
     @property
     def game_id(self) -> str:
@@ -193,6 +214,7 @@ class GameRegistry:
             terminal_status=status,
             free_trial=bool(doc.get("free_trial")),
             failed_phase_count=int(doc.get("failed_phase_count") or 0),
+            usage_by_power=dict(doc.get("usage_by_power") or {}),
         )
         self._games[game_id] = game
         self._games.move_to_end(game_id)

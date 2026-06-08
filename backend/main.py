@@ -290,6 +290,7 @@ def _persist(game: Game) -> str | None:
             terminal_status=game.terminal_status,
             free_trial=game.free_trial,
             failed_phase_count=game.failed_phase_count,
+            usage_by_power=game.usage_by_power,
         )
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
@@ -407,6 +408,7 @@ async def get_state(game_id: str, user: dict = Depends(current_user_verified)):
     state["game_id"] = game_id
     state["terminal_status"] = game.terminal_status
     state["free_trial"] = game.free_trial
+    state["usage_by_power"] = game.usage_by_power
     # Never expose the encrypted key over the API — even ciphertext leaks
     # narrow attacker time budget for offline brute-forcing.
     state["agents_config"] = {
@@ -494,6 +496,7 @@ async def _run_call(game: Game, call: dict, board_state: dict):
             call["end_reason"] = f"error: {exc}"
             break
 
+        game.record_usage(speaker, payload.get("_usage") or {})
         game.engine.save_notes(speaker, payload.get("notes_to_save", []))
         for note in payload.get("notes_to_save", []):
             await game.manager.broadcast({"type": "note_saved", "power": speaker, "text": note})
@@ -577,6 +580,7 @@ async def run_negotiation(game_id: str, user: dict = Depends(current_user_verifi
                 await game.manager.broadcast({"type": "agent_error", "power": "?", "error": str(item)})
                 continue
             power, payload = item
+            game.record_usage(power, payload.get("_usage") or {})
             game.engine.save_notes(power, payload.get("notes_to_save", []))
             await game.manager.broadcast({
                 "type": "thought", "power": power,
@@ -674,6 +678,7 @@ async def run_orders(game_id: str, user: dict = Depends(current_user_verified)):
             await game.manager.broadcast({"type": "agent_error", "power": "?", "error": str(item)})
             continue
         power, payload = item
+        game.record_usage(power, payload.get("_usage") or {})
         game.engine.save_notes(power, payload.get("notes_to_save", []))
         await game.manager.broadcast({
             "type": "thought",

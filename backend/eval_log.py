@@ -17,6 +17,7 @@ def write_game_log(
     terminal_status: str = "active",
     free_trial: bool = False,
     failed_phase_count: int = 0,
+    usage_by_power: Optional[Dict[str, Dict]] = None,
 ) -> str:
     """Persist a game snapshot.
 
@@ -30,7 +31,10 @@ def write_game_log(
 
     `failed_phase_count` — consecutive phases where no agent produced
     meaningful output. Reset to 0 on any successful phase. Crossing
-    the threshold flips terminal_status to 'errored'."""
+    the threshold flips terminal_status to 'errored'.
+
+    `usage_by_power` — running token + cost totals per power, keyed by
+    power name. Populated by Game.record_usage on every LLM call."""
     state = engine.get_state()
     payload = {
         "game_id": engine.game_id,
@@ -38,6 +42,7 @@ def write_game_log(
         "terminal_status": terminal_status,
         "free_trial": free_trial,
         "failed_phase_count": failed_phase_count,
+        "usage_by_power": usage_by_power or {},
         "started_at": engine.started_at,
         "updated_at": time.time(),
         "agents_config": agents_config,

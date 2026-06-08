@@ -17,6 +17,53 @@ import litellm
 logger = logging.getLogger(__name__)
 
 
+def _merge_usage(a: dict, b: dict) -> dict:
+    """Sum two usage dicts. Either side may be empty {} (e.g. provider
+    didn't report on a streamed call). Empty + non-empty preserves the
+    non-empty values; empty + empty stays empty."""
+    if not a:
+        return dict(b) if b else {}
+    if not b:
+        return dict(a) if a else {}
+    return {
+        "input_tokens": int(a.get("input_tokens", 0)) + int(b.get("input_tokens", 0)),
+        "output_tokens": int(a.get("output_tokens", 0)) + int(b.get("output_tokens", 0)),
+        "total_tokens": int(a.get("total_tokens", 0)) + int(b.get("total_tokens", 0)),
+        "cost_usd": float(a.get("cost_usd", 0.0)) + float(b.get("cost_usd", 0.0)),
+    }
+
+
+def _usage_to_dict(model: str, usage) -> dict:
+    """Normalise a litellm usage object into a small JSON-safe dict + add
+    a USD cost estimate. usage can be None (provider didn't report) or a
+    pydantic-ish object with prompt_tokens / completion_tokens. Cost is
+    looked up via litellm.cost_per_token; unknown models silently fall
+    back to 0 so a stale catalog entry doesn't crash the phase."""
+    if usage is None:
+        return {}
+    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    cost_usd = 0.0
+    if input_tokens or output_tokens:
+        try:
+            prompt_cost, completion_cost = litellm.cost_per_token(
+                model=model,
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+            )
+            cost_usd = float(prompt_cost) + float(completion_cost)
+        except Exception:  # noqa: BLE001
+            # litellm raises for models it doesn't price. Don't let a
+            # pricing miss kill the call — log + emit zero.
+            logger.warning("cost_per_token failed model=%s — recording zero", model)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_usd": cost_usd,
+    }
+
+
 def _extract_json_blob(text: str):
     """Pull the JSON object out of an LLM response (fenced or bare)."""
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -105,13 +152,19 @@ class Agent:
         self.api_key = api_key
 
     async def _one_completion(self, messages, stream_callback, channel):
-        """Single LiteLLM streaming call. Returns the full concatenated text.
-        Streaming exceptions propagate so the caller can decide whether to retry."""
+        """Single LiteLLM streaming call. Returns (full_text, usage_dict).
+        usage_dict has the shape {input_tokens, output_tokens, total_tokens,
+        cost_usd} when the provider reports usage on the final chunk; empty
+        dict otherwise. Streaming exceptions propagate so the caller can
+        decide whether to retry."""
         kwargs = {
             "model": self.model,
             "messages": messages,
             "stream": True,
             "max_tokens": 2500,
+            # Ask litellm to surface token counts on the final chunk so we
+            # can accumulate per-game spend without a follow-up call.
+            "stream_options": {"include_usage": True},
         }
         if self.api_key:
             # LiteLLM honours per-call api_key for all the providers we
@@ -119,35 +172,47 @@ class Agent:
             kwargs["api_key"] = self.api_key
         response = await litellm.acompletion(**kwargs)
         full = ""
+        usage = None
         async for chunk in response:
+            # The final chunk in include_usage mode carries totals and may
+            # have empty `choices`. Capture usage whenever it shows up.
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+            if not chunk.choices:
+                continue
             content = chunk.choices[0].delta.content
             if not content:
                 continue
             full += content
             if stream_callback:
                 await stream_callback(self.power, content, channel)
-        return full
+        return full, _usage_to_dict(self.model, usage)
 
     async def _stream_and_parse(self, prompt, stream_callback, channel):
         """Stream a completion and parse the JSON payload out of it. If the
         first response can't be parsed (model wandered off-format, fence
         mismatched, etc.) re-ask once with a tight repair prompt before
-        giving up — silently returning {} causes a power to forfeit a phase."""
+        giving up — silently returning {} causes a power to forfeit a phase.
+
+        Returns (blob, raw_text, usage). usage sums token / cost across
+        the initial attempt AND any repair attempt — the caller persists
+        it under the power's running total."""
         logger.info("LLM call start power=%s channel=%s model=%s", self.power, channel, self.model)
         messages = [{"role": "user", "content": prompt}]
         try:
-            full = await self._one_completion(messages, stream_callback, channel)
+            full, usage = await self._one_completion(messages, stream_callback, channel)
         except Exception as exc:  # noqa: BLE001
             logger.exception("LLM call failed power=%s channel=%s model=%s", self.power, channel, self.model)
             err = f"[Error: {exc}]"
             if stream_callback:
                 await stream_callback(self.power, err, channel)
-            return {}, err
+            return {}, err, {}
 
         blob = _extract_json_blob(full)
         if blob:
             logger.info("LLM call ok power=%s channel=%s raw_len=%d keys=%s", self.power, channel, len(full), list(blob.keys()))
-            return blob, full
+            return blob, full, usage
 
         logger.warning(
             "LLM returned no parseable JSON power=%s channel=%s raw_len=%d raw_head=%r — retrying",
@@ -164,10 +229,10 @@ class Agent:
             )},
         ]
         try:
-            full2 = await self._one_completion(repair_messages, stream_callback, channel)
+            full2, usage2 = await self._one_completion(repair_messages, stream_callback, channel)
         except Exception as exc:  # noqa: BLE001
             logger.exception("LLM repair call failed power=%s channel=%s", self.power, channel)
-            return {}, f"[Error: {exc}]"
+            return {}, f"[Error: {exc}]", usage
 
         blob2 = _extract_json_blob(full2) or {}
         if blob2:
@@ -177,7 +242,9 @@ class Agent:
                 "LLM repair also unparseable power=%s channel=%s raw_head=%r",
                 self.power, channel, full2[:300],
             )
-        return blob2, full2
+        # The retry burned tokens too — caller is charged the full bill.
+        combined = _merge_usage(usage, usage2)
+        return blob2, full2, combined
 
     async def negotiate(
         self,
@@ -252,7 +319,7 @@ Examples of good notes:
   - "Germany ignored my non-aggression proposal — treat as hostile."
   - "Plan: take BEL fall 1901 with F NTH support."
 `messages` and `notes_to_save` may both be empty if you have nothing to add."""
-        blob, _ = await self._stream_and_parse(prompt, stream_callback, "negotiate")
+        blob, _, usage = await self._stream_and_parse(prompt, stream_callback, "negotiate")
         return {
             "thought": blob.get("thought", ""),
             "notes_to_save": [n for n in (blob.get("notes_to_save") or []) if isinstance(n, str)],
@@ -261,6 +328,7 @@ Examples of good notes:
                 c for c in (blob.get("calls") or [])
                 if isinstance(c, dict) and c.get("to") and c.get("topic")
             ] if calls_enabled else [],
+            "_usage": usage,
         }
 
     async def respond_in_call(
@@ -312,7 +380,7 @@ Reply with ONE JSON object inside a ```json``` fence:
 ```
 
 Set `end_call: true` when you want to close the call (and explain in `end_reason`)."""
-        blob, _ = await self._stream_and_parse(prompt, stream_callback, "call")
+        blob, _, usage = await self._stream_and_parse(prompt, stream_callback, "call")
         reply = (blob.get("reply") or "").strip()
         return {
             "thought": blob.get("thought", ""),
@@ -320,6 +388,7 @@ Set `end_call: true` when you want to close the call (and explain in `end_reason
             "reply": reply,
             "end_call": bool(blob.get("end_call")) or len(reply) < 8,
             "end_reason": blob.get("end_reason"),
+            "_usage": usage,
         }
 
     async def generate_orders(
@@ -398,7 +467,7 @@ Reply with ONE JSON object inside a ```json``` fence:
 ```
 
 `commitments` is optional — declare them only when you want to be held accountable to a specific promise this turn. They will be checked against your actual orders."""
-        blob, _ = await self._stream_and_parse(prompt, stream_callback, "orders")
+        blob, _, usage = await self._stream_and_parse(prompt, stream_callback, "orders")
         orders = blob.get("orders") or []
         commitments = blob.get("commitments") or []
         return {
@@ -406,4 +475,5 @@ Reply with ONE JSON object inside a ```json``` fence:
             "notes_to_save": [n for n in (blob.get("notes_to_save") or []) if isinstance(n, str)],
             "orders": [o for o in orders if isinstance(o, str)],
             "commitments": [c for c in commitments if isinstance(c, dict) and c.get("text")],
+            "_usage": usage,
         }
