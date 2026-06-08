@@ -17,7 +17,7 @@ from html import escape
 from typing import Optional
 
 
-# Colors lifted from /Users/jterry/dev/diplo-ai-fe/src/app.css [data-theme='parchment']
+# Colors mirror the FE parchment theme (src/app.css [data-theme='parchment']).
 _BG = "#ece1c2"          # warm cream backdrop
 _SURFACE = "#f6ecd0"     # card surface
 _BORDER = "#c5b893"      # parchment border
