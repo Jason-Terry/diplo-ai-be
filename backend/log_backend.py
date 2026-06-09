@@ -47,6 +47,20 @@ class LogBackend(ABC):
         the engine already flagged is_complete, else "active". Idempotent."""
         ...
 
+    @abstractmethod
+    def backfill_visibility_and_invalidation(self) -> int:
+        """Default `visibility` to "private" where missing, and translate
+        legacy terminal_status="refunded" records to invalidated=true with
+        invalidation_reason="refunded". Idempotent."""
+        ...
+
+    @abstractmethod
+    def list_public_games(self) -> list[dict]:
+        """All non-invalidated games with visibility=='public'. Powers the
+        public browse page. Caller (FE) is logged-in but doesn't need to
+        own these."""
+        ...
+
 
 def _summarize(doc: dict) -> dict:
     """Project a full game document to the index-row fields. terminal_status
@@ -55,10 +69,16 @@ def _summarize(doc: dict) -> dict:
     status = doc.get("terminal_status")
     if not status:
         status = "complete" if doc.get("is_complete") else "active"
+    # Legacy: terminal_status='refunded' counts as invalidated even when
+    # the explicit flag hasn't been backfilled yet.
+    invalidated = bool(doc.get("invalidated")) or status == "refunded"
     return {
         "game_id": doc.get("game_id"),
         "owner_id": doc.get("owner_id"),
         "terminal_status": status,
+        "visibility": doc.get("visibility") or "private",
+        "invalidated": invalidated,
+        "invalidation_reason": doc.get("invalidation_reason"),
         "free_trial": bool(doc.get("free_trial")),
         "winner": doc.get("winner"),
         "is_complete": doc.get("is_complete"),
@@ -66,6 +86,17 @@ def _summarize(doc: dict) -> dict:
         "started_at": doc.get("started_at"),
         "updated_at": doc.get("updated_at"),
     }
+
+
+def _is_invalidated(doc: dict) -> bool:
+    """One source of truth for "should this game be hidden from everyone."
+    True when the explicit flag is set OR the legacy terminal_status
+    value is 'refunded' (pre-migration records)."""
+    if doc.get("invalidated"):
+        return True
+    if doc.get("terminal_status") == "refunded":
+        return True
+    return False
 
 
 # ─── File backend ────────────────────────────────────────────────────────────
@@ -104,11 +135,30 @@ class FileBackend(LogBackend):
                 continue
             if owner_id is not None and doc.get("owner_id") != owner_id:
                 continue
-            # Refunded games are intentionally hidden — the user invalidated
-            # them and they have a replacement game already.
-            if doc.get("terminal_status") == "refunded":
+            if _is_invalidated(doc):
                 continue
             out.append(_summarize(doc))
+        return out
+
+    def list_public_games(self) -> list[dict]:
+        if not os.path.isdir(self.logs_dir):
+            return []
+        out: list[dict] = []
+        for fname in sorted(os.listdir(self.logs_dir)):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.logs_dir, fname), encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            if doc.get("visibility") != "public":
+                continue
+            if _is_invalidated(doc):
+                continue
+            out.append(_summarize(doc))
+        # Sort newest-first by updated_at; the FE will paginate if needed.
+        out.sort(key=lambda d: d.get("updated_at") or 0, reverse=True)
         return out
 
     def read_game(self, game_id: str) -> dict:
@@ -164,6 +214,37 @@ class FileBackend(LogBackend):
             n += 1
         return n
 
+    def backfill_visibility_and_invalidation(self) -> int:
+        if not os.path.isdir(self.logs_dir):
+            return 0
+        n = 0
+        for fname in os.listdir(self.logs_dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(self.logs_dir, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            changed = False
+            if "visibility" not in doc:
+                doc["visibility"] = "private"
+                changed = True
+            # Translate legacy refunded marker into the new explicit fields.
+            if doc.get("terminal_status") == "refunded" and not doc.get("invalidated"):
+                doc["invalidated"] = True
+                doc["invalidation_reason"] = doc.get("invalidation_reason") or "refunded"
+                changed = True
+            if not changed:
+                continue
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, default=str)
+            os.replace(tmp, path)
+            n += 1
+        return n
+
 
 # ─── Mongo backend ───────────────────────────────────────────────────────────
 
@@ -184,6 +265,8 @@ class MongoBackend(LogBackend):
         # owner_id powers the /api/games-per-user filter; without an index
         # every list page does a full collection scan.
         self.games.create_index([("owner_id", ASCENDING)])
+        # visibility powers /api/games/public (the spectator browse page).
+        self.games.create_index([("visibility", ASCENDING)])
 
     def write_game(self, payload: dict) -> str:
         doc: dict[str, Any] = dict(payload)
@@ -192,25 +275,52 @@ class MongoBackend(LogBackend):
         return doc["_id"]
 
     def list_games(self, owner_id: str | None = None) -> list[dict]:
-        # Refunded games are hidden — they were invalidated and replaced.
-        query: dict = {"terminal_status": {"$ne": "refunded"}}
+        # Invalidated games are hidden — owner refunded them or admin
+        # killed them. Legacy "refunded" terminal_status counts as
+        # invalidated until the backfill catches up.
+        query: dict = {
+            "$and": [
+                {"invalidated": {"$ne": True}},
+                {"terminal_status": {"$ne": "refunded"}},
+            ],
+        }
         if owner_id is not None:
             query["owner_id"] = owner_id
         cursor = self.games.find(
             query,
-            projection={
-                "game_id": 1,
-                "owner_id": 1,
-                "terminal_status": 1,
-                "free_trial": 1,
-                "winner": 1,
-                "is_complete": 1,
-                "turns": 1,
-                "started_at": 1,
-                "updated_at": 1,
-            },
+            projection=self._summary_projection(),
         ).sort("updated_at", -1)
         return [_summarize(doc) for doc in cursor]
+
+    def list_public_games(self) -> list[dict]:
+        cursor = self.games.find(
+            {
+                "visibility": "public",
+                "$and": [
+                    {"invalidated": {"$ne": True}},
+                    {"terminal_status": {"$ne": "refunded"}},
+                ],
+            },
+            projection=self._summary_projection(),
+        ).sort("updated_at", -1)
+        return [_summarize(doc) for doc in cursor]
+
+    @staticmethod
+    def _summary_projection() -> dict:
+        return {
+            "game_id": 1,
+            "owner_id": 1,
+            "terminal_status": 1,
+            "visibility": 1,
+            "invalidated": 1,
+            "invalidation_reason": 1,
+            "free_trial": 1,
+            "winner": 1,
+            "is_complete": 1,
+            "turns": 1,
+            "started_at": 1,
+            "updated_at": 1,
+        }
 
     def read_game(self, game_id: str) -> dict:
         doc = self.games.find_one({"_id": game_id})
@@ -225,6 +335,19 @@ class MongoBackend(LogBackend):
             {"$set": {"owner_id": owner_id}},
         )
         return int(result.modified_count)
+
+    def backfill_visibility_and_invalidation(self) -> int:
+        # Pass 1: missing visibility → private.
+        r1 = self.games.update_many(
+            {"$or": [{"visibility": {"$exists": False}}, {"visibility": None}]},
+            {"$set": {"visibility": "private"}},
+        )
+        # Pass 2: legacy terminal_status="refunded" → invalidated + reason.
+        r2 = self.games.update_many(
+            {"terminal_status": "refunded", "invalidated": {"$ne": True}},
+            {"$set": {"invalidated": True, "invalidation_reason": "refunded"}},
+        )
+        return int(r1.modified_count) + int(r2.modified_count)
 
     def backfill_terminal_status(self) -> int:
         # Two passes — completed games become "complete"; everything else

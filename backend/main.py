@@ -39,10 +39,12 @@ from backend.byok import PROVIDERS
 from backend.eval_log import (
     backfill_owner_id,
     backfill_terminal_status,
+    backfill_visibility_and_invalidation,
     list_games,
     read_game,
     write_game_log,
 )
+from backend.log_backend import get_backend as _get_log_backend
 from backend.game_engine import PhaseStep
 from backend.game_store import Game, registry
 from backend.policies import (
@@ -142,6 +144,13 @@ def _run_migrations() -> None:
             log.info("backfill: stamped terminal_status on %d legacy game(s)", n)
     except Exception:  # noqa: BLE001
         log.exception("backfill: terminal_status write failed; skipping")
+
+    try:
+        n = backfill_visibility_and_invalidation()
+        if n:
+            log.info("backfill: stamped visibility/invalidated on %d legacy game(s)", n)
+    except Exception:  # noqa: BLE001
+        log.exception("backfill: visibility/invalidation write failed; skipping")
 
 
 class GameSlot(BaseModel):
@@ -249,15 +258,35 @@ def _require_game(game_id: str) -> Game:
 
 
 def _require_owned_game(game_id: str, user: dict) -> Game:
-    """Fetch a game the caller is allowed to see. Returns 404 (not 403) on
-    ownership mismatch so we don't leak whether a given game_id exists."""
+    """Fetch a game the caller is allowed to write to. Returns 404 on
+    ownership mismatch so we don't leak whether a given game_id exists.
+    Also 404 on invalidated games — even the owner can't act on those."""
     game = _require_game(game_id)
-    # owner_id is None on legacy records the startup migration hasn't reached
-    # yet; treat them as inaccessible to everyone except their (eventual)
-    # owner. Once the migration runs, every doc has an owner_id.
+    if game.invalidated:
+        raise HTTPException(status_code=404, detail=f"game {game_id} not found")
     if game.owner_id != user["_id"]:
         raise HTTPException(status_code=404, detail=f"game {game_id} not found")
     return game
+
+
+def _require_viewable_game(game_id: str, user: dict) -> Game:
+    """Fetch a game the caller is allowed to read. The viewable set:
+      - owner of the game, OR
+      - any logged-in user when visibility ∈ {shared, public}.
+    Invalidated games are 404 for everyone (including owner) — they're
+    gone, not browseable as history.
+
+    Used by all read endpoints (GET game, GET state, WS upgrade). Write
+    endpoints stay on _require_owned_game."""
+    game = _require_game(game_id)
+    if game.invalidated:
+        raise HTTPException(status_code=404, detail=f"game {game_id} not found")
+    if game.owner_id == user["_id"]:
+        return game
+    if game.visibility in ("shared", "public"):
+        return game
+    # Stranger looking at someone else's private game — same 404 shape.
+    raise HTTPException(status_code=404, detail=f"game {game_id} not found")
 
 
 def _require_active_game(game_id: str, user: dict) -> Game:
@@ -291,10 +320,16 @@ def _persist(game: Game) -> str | None:
             free_trial=game.free_trial,
             failed_phase_count=game.failed_phase_count,
             usage_by_power=game.usage_by_power,
+            visibility=game.visibility,
+            invalidated=game.invalidated,
+            invalidation_reason=game.invalidation_reason,
         )
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("write_game_log failed game_id=%s", game.game_id)
         return None
+
+
+VALID_VISIBILITIES = {"private", "shared", "public"}
 
 
 # Two consecutive empty phases is the threshold. Single bad phase often
@@ -390,25 +425,40 @@ async def create_game(body: CreateGameIn, user: dict = Depends(current_user_veri
     return {"game_id": game.game_id, "status": "started", "config": safe_config}
 
 
+@app.get("/api/games/public")
+async def list_public_games_endpoint(user: dict = Depends(current_user_verified)):
+    """Browse page — every game with visibility='public' that isn't
+    invalidated. Logged-in users only (no anonymous discovery). Each
+    user still sees the same list; spectator role is enforced on the
+    individual game view."""
+    return {"games": _get_log_backend().list_public_games()}
+
+
 @app.get("/api/games/{game_id}")
 async def get_game(game_id: str, user: dict = Depends(current_user_verified)):
-    """Full persisted document — for the games browser / history view."""
+    """Full persisted document — for the results page and history view.
+    Visible to owner + (shared/public viewers). Invalidated games 404."""
     data = read_game(game_id)
-    if not data or data.get("owner_id") != user["_id"]:
-        # 404 on owner mismatch matches _require_owned_game — same shape
-        # whether the game doesn't exist or just isn't yours.
+    if not data:
+        raise HTTPException(status_code=404, detail=f"game {game_id} not found")
+    if data.get("invalidated") or data.get("terminal_status") == "refunded":
+        raise HTTPException(status_code=404, detail=f"game {game_id} not found")
+    visibility = data.get("visibility") or "private"
+    if data.get("owner_id") != user["_id"] and visibility not in ("shared", "public"):
         raise HTTPException(status_code=404, detail=f"game {game_id} not found")
     return data
 
 
 @app.get("/api/games/{game_id}/state")
 async def get_state(game_id: str, user: dict = Depends(current_user_verified)):
-    game = _require_owned_game(game_id, user)
+    game = _require_viewable_game(game_id, user)
     state = game.engine.get_state()
     state["game_id"] = game_id
     state["terminal_status"] = game.terminal_status
     state["free_trial"] = game.free_trial
     state["usage_by_power"] = game.usage_by_power
+    state["visibility"] = game.visibility
+    state["is_owner"] = game.owner_id == user["_id"]
     # Never expose the encrypted key over the API — even ciphertext leaks
     # narrow attacker time budget for offline brute-forcing.
     state["agents_config"] = {
@@ -420,24 +470,48 @@ async def get_state(game_id: str, user: dict = Depends(current_user_verified)):
     return state
 
 
+class VisibilityIn(BaseModel):
+    visibility: str  # "private" | "shared" | "public"
+
+
+@app.post("/api/games/{game_id}/visibility")
+async def set_visibility(
+    game_id: str,
+    body: VisibilityIn,
+    user: dict = Depends(current_user_verified),
+):
+    """Owner-only: update the game's visibility. Idempotent."""
+    game = _require_owned_game(game_id, user)
+    if body.visibility not in VALID_VISIBILITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"visibility must be one of {sorted(VALID_VISIBILITIES)}",
+        )
+    game.visibility = body.visibility
+    _persist(game)
+    await game.manager.broadcast({"type": "visibility_changed", "visibility": body.visibility})
+    return {"game_id": game_id, "visibility": body.visibility}
+
+
 @app.websocket("/ws/games/{game_id}")
 async def websocket_endpoint(websocket: WebSocket, game_id: str):
-    """WS upgrade auth: read the session cookie that the browser attaches
-    on the upgrade request, decode the JWT, and require the caller to be
-    the game's owner. Reject with a code that's distinguishable in the FE
-    (4401 not authed, 4403 not owner, 4404 game gone)."""
+    """WS upgrade auth: cookie identifies the caller. They get to subscribe
+    if they own the game OR visibility is shared/public. Invalidated games
+    refuse outright. Codes:
+      4401 not authenticated
+      4403 game is private and you're not the owner
+      4404 no such game (or invalidated)"""
     session = websocket.cookies.get(COOKIE_NAME)
     user_id = decode_jwt(session) if session else None
     if not user_id:
         await websocket.close(code=4401, reason="not authenticated")
         return
     game = registry.get(game_id)
-    if game is None:
+    if game is None or game.invalidated:
         await websocket.close(code=4404, reason=f"game {game_id} not found")
         return
-    if game.owner_id != user_id:
-        # 4403 (not the standard close code range — we use 4xxx for
-        # application-level reasons FastAPI rejects on accept).
+    is_owner = game.owner_id == user_id
+    if not is_owner and game.visibility not in ("shared", "public"):
         await websocket.close(code=4403, reason="not your game")
         return
     await game.manager.connect(websocket)
@@ -725,10 +799,10 @@ async def refund_game(game_id: str, user: dict = Depends(current_user_verified))
             detail="Refund flow is only available for free-trial games. "
                    "Start a new game from the dashboard.",
         )
-    if game.terminal_status in ("complete", "refunded"):
+    if game.terminal_status == "complete":
         raise HTTPException(
             status_code=409,
-            detail=f"cannot refund a {game.terminal_status} game",
+            detail="cannot refund a completed game",
         )
 
     refunds_used = int(user.get("refunds_used") or 0)
@@ -743,10 +817,13 @@ async def refund_game(game_id: str, user: dict = Depends(current_user_verified))
 
     # Mark + persist the old game first; if anything blows up later, the
     # user can still see they didn't end up double-billed for the broken
-    # game. The new-game creation is the "actual" cost path.
-    game.terminal_status = "refunded"
+    # game. Use the new invalidated+reason fields rather than the legacy
+    # terminal_status="refunded" sentinel — that string sticks around
+    # only for backwards-compat with already-persisted games.
+    game.invalidated = True
+    game.invalidation_reason = "refunded"
     _persist(game)
-    await game.manager.broadcast({"type": "game_terminal", "terminal_status": "refunded"})
+    await game.manager.broadcast({"type": "game_terminal", "invalidated": True, "reason": "refunded"})
 
     new_game = registry.create(
         game.agent_config,

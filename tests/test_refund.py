@@ -43,8 +43,11 @@ def test_free_trial_game_can_be_refunded(client, make_user, auth_cookie):
     assert body["refunds_used"] == 1
     assert body["refunds_limit"] == REFUND_LIMIT
 
-    # Old game's status flipped to "refunded".
-    assert registry.get(old_id).terminal_status == "refunded"
+    # Old game is now invalidated with the correct reason; terminal_status
+    # remains whatever it was (lifecycle stays untouched).
+    old = registry.get(old_id)
+    assert old.invalidated is True
+    assert old.invalidation_reason == "refunded"
     # And it disappears from the user's listing.
     games = client.get("/api/games").json()["games"]
     ids = {g["game_id"] for g in games}
@@ -75,13 +78,17 @@ def test_completed_game_cannot_be_refunded(client, make_user, auth_cookie):
 
 
 def test_already_refunded_game_cannot_be_refunded_again(client, make_user, auth_cookie):
+    """An invalidated game is gone — second refund attempt should 404,
+    not 409, because the game itself is no longer accessible."""
     user = make_user()
     game_id = _seed_game(user["_id"], free_trial=True)
-    registry.get(game_id).terminal_status = "refunded"
+    g = registry.get(game_id)
+    g.invalidated = True
+    g.invalidation_reason = "refunded"
 
     client.cookies.set(COOKIE_NAME, auth_cookie(user["_id"]))
     r = client.post(f"/api/games/{game_id}/refund")
-    assert r.status_code == 409
+    assert r.status_code == 404
 
 
 def test_refund_limit_returns_429(client, make_user, auth_cookie):

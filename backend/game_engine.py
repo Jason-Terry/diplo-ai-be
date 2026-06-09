@@ -37,7 +37,11 @@ def _initial_step_for_phase_type(phase_type: str) -> str:
 class DiplomacyEngine:
     def __init__(self, game_id: str | None = None):
         self.game = Game()
-        self.game_id = game_id or f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        # 12 hex chars = 48 bits = 281T values. Globally unique enough for
+        # public-spectator routing without needing a per-user namespace.
+        # Existing timestamp-prefixed ids (1780975326_a1b2c3d4) still match
+        # exactly through the regular lookup path.
+        self.game_id = game_id or uuid.uuid4().hex[:12]
         self.started_at = time.time()
         self.phase_step: str = _initial_step_for_phase_type(self.game.phase_type)
         self.messages: List[dict] = []

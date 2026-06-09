@@ -73,6 +73,9 @@ class Game:
         free_trial: bool = False,
         failed_phase_count: int = 0,
         usage_by_power: Optional[Dict[str, Dict]] = None,
+        visibility: str = "private",
+        invalidated: bool = False,
+        invalidation_reason: Optional[str] = None,
     ) -> None:
         self.engine = engine
         self.agents = agents
@@ -92,6 +95,16 @@ class Game:
         # and any repair retries). For free-trial games the cost is on us
         # but we still track it for our own spend telemetry.
         self.usage_by_power: Dict[str, Dict] = usage_by_power or {}
+        # Spectator / share model:
+        #   private  — only owner can view (default)
+        #   shared   — any logged-in user with the URL can view
+        #   public   — any logged-in user can view AND it appears on /browse
+        self.visibility = visibility
+        # When invalidated, the game 404s for everyone (including owner).
+        # invalidation_reason carries the cause: "refunded" today; more
+        # values like "admin_removed" or "abuse" foreseeable.
+        self.invalidated = invalidated
+        self.invalidation_reason = invalidation_reason
         self.manager = ConnectionManager()
         self.last_used = time.time()
 
@@ -215,6 +228,12 @@ class GameRegistry:
             free_trial=bool(doc.get("free_trial")),
             failed_phase_count=int(doc.get("failed_phase_count") or 0),
             usage_by_power=dict(doc.get("usage_by_power") or {}),
+            visibility=doc.get("visibility") or "private",
+            invalidated=(
+                bool(doc.get("invalidated"))
+                or doc.get("terminal_status") == "refunded"  # legacy
+            ),
+            invalidation_reason=doc.get("invalidation_reason"),
         )
         self._games[game_id] = game
         self._games.move_to_end(game_id)
